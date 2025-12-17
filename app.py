@@ -32,12 +32,8 @@ def sha256_bytes(b: bytes) -> str:
 def normalize_text(s: str) -> str:
     if s is None:
         return ""
-    s = str(s)
-    s = s.strip().lower()
-    repl = {
-        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
-        "ñ": "n", "ü": "u"
-    }
+    s = str(s).strip().lower()
+    repl = {"á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u", "ñ": "n", "ü": "u"}
     for k, v in repl.items():
         s = s.replace(k, v)
     s = re.sub(r"\s+", " ", s)
@@ -123,6 +119,13 @@ def extract_ticket_number(x) -> str | None:
 
 
 def parse_clp_amount(x) -> float:
+    """
+    Soporta montos tipo:
+      19980
+      497.572  -> 497572
+      14.968   -> 14968
+      $28.47   -> heurística: 28.47 * 1000 = 28470 (caso típico Sheet/locale)
+    """
     if pd.isna(x):
         return 0.0
 
@@ -149,16 +152,14 @@ def parse_clp_amount(x) -> float:
                 pass
 
     if has_dot and not has_comma:
-        s2 = s.replace(".", "")
-        s2 = re.sub(r"[^\d\-]", "", s2)
+        s2 = re.sub(r"[^\d\-]", "", s.replace(".", ""))
         try:
             return float(s2) if s2 != "" else 0.0
         except Exception:
             return 0.0
 
     if has_comma and not has_dot:
-        s2 = s.replace(",", "")
-        s2 = re.sub(r"[^\d\-]", "", s2)
+        s2 = re.sub(r"[^\d\-]", "", s.replace(",", ""))
         try:
             return float(s2) if s2 != "" else 0.0
         except Exception:
@@ -168,11 +169,9 @@ def parse_clp_amount(x) -> float:
         last_dot = s.rfind(".")
         last_comma = s.rfind(",")
         if last_comma > last_dot:
-            s2 = s.replace(".", "").replace(",", ".")
-            s2 = re.sub(r"[^\d\.\-]", "", s2)
+            s2 = re.sub(r"[^\d\.\-]", "", s.replace(".", "").replace(",", "."))
         else:
-            s2 = s.replace(",", "")
-            s2 = re.sub(r"[^\d\.\-]", "", s2)
+            s2 = re.sub(r"[^\d\.\-]", "", s.replace(",", ""))
         try:
             return float(s2) if s2 != "" else 0.0
         except Exception:
@@ -186,13 +185,7 @@ def parse_clp_amount(x) -> float:
 
 
 def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    # Si hay columnas duplicadas, nos quedamos con el primer match por nombre normalizado
-    cols_norm = {}
-    for c in df.columns:
-        cn = normalize_text(c)
-        if cn not in cols_norm:
-            cols_norm[cn] = c
-
+    cols_norm = {normalize_text(c): c for c in df.columns}
     for cand in candidates:
         c_norm = normalize_text(cand)
         if c_norm in cols_norm:
@@ -200,31 +193,28 @@ def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
-def get_series(df: pd.DataFrame, col: str) -> pd.Series:
-    """
-    Protege contra el caso donde df[col] devuelve DataFrame (columnas duplicadas).
-    Devuelve siempre una Series.
-    """
-    obj = df[col]
-    if isinstance(obj, pd.DataFrame):
-        return obj.iloc[:, 0]
-    return obj
-
-
-def first_non_empty(series: pd.Series):
-    if series is None or len(series) == 0:
+def _first_nonempty(series: pd.Series):
+    if series is None:
         return ""
-    s = series.dropna().astype(str)
-    s = s[s.str.strip() != ""]
+    s = series.dropna().astype(str).map(lambda x: x.strip())
+    s = s[s != ""]
     return s.iloc[0] if len(s) else ""
 
 
-def min_datetime(series: pd.Series):
-    if series is None or len(series) == 0:
-        return pd.NaT
-    s = pd.to_datetime(series, errors="coerce")
-    s = s.dropna()
-    return s.min() if len(s) else pd.NaT
+def _min_date(series: pd.Series):
+    s = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    if s.notna().any():
+        return s.min()
+    return pd.NaT
+
+
+def _join_unique_nonempty(series: pd.Series, sep: str = " | "):
+    s = series.dropna().astype(str).map(lambda x: x.strip())
+    s = s[s != ""]
+    if not len(s):
+        return ""
+    uniq = pd.unique(s)
+    return sep.join([u for u in uniq if u != ""])
 
 
 def standardize_saldo(df: pd.DataFrame) -> pd.DataFrame:
@@ -236,12 +226,12 @@ def standardize_saldo(df: pd.DataFrame) -> pd.DataFrame:
     c_motivo = pick_col(df, ["Motivo compensación", "Motivo compensacion", "Motivo"])
 
     out = pd.DataFrame()
-    out["Fecha"] = coerce_datetime(get_series(df, c_fecha)) if c_fecha else pd.NaT
-    out["Dirección de correo electrónico"] = get_series(df, c_mail_agente) if c_mail_agente else ""
-    out["Numero"] = get_series(df, c_ticket).apply(extract_ticket_number) if c_ticket else None
-    out["Correo registrado en Cabify para realizar la carga"] = get_series(df, c_mail_carga) if c_mail_carga else ""
-    out["Monto_saldo"] = get_series(df, c_monto).apply(parse_clp_amount) if c_monto else 0.0
-    out["Motivo_saldo"] = get_series(df, c_motivo) if c_motivo else ""
+    out["Fecha"] = coerce_datetime(df[c_fecha]) if c_fecha else pd.NaT
+    out["Dirección de correo electrónico"] = df[c_mail_agente] if c_mail_agente else ""
+    out["Numero"] = df[c_ticket].apply(extract_ticket_number) if c_ticket else None
+    out["Correo registrado en Cabify para realizar la carga"] = df[c_mail_carga] if c_mail_carga else ""
+    out["Monto_saldo"] = df[c_monto].apply(parse_clp_amount) if c_monto else 0.0
+    out["Motivo_saldo"] = df[c_motivo] if c_motivo else ""
     out["Fuente_saldo"] = True
     return out
 
@@ -250,25 +240,25 @@ def standardize_transfer(df: pd.DataFrame) -> pd.DataFrame:
     c_fecha = pick_col(df, ["Marca temporal", "Timestamp", "Fecha", "fecha"])
     c_mail_agente = pick_col(df, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email", "Agente"])
     c_motivo = pick_col(df, ["Motivo"])
-    c_monto = pick_col(df, ["Monto"])
+    c_monto = pick_col(df, ["Monto"])  # si hay 2, este pick toma el primero que calce por nombre exacto
     c_correo = pick_col(df, ["Correo", "Correo registrado", "Email pasajero"])
     c_ticket = pick_col(df, ["Ticket", "Numero ticket", "Número ticket"])
     c_motivo_aerop = pick_col(df, ["Si es compensación Aeropuerto selecciona el motivo", "Si es compensacion Aeropuerto selecciona el motivo"])
-    c_id_reserva = pick_col(df, ["Link payments, link del viaje o numero reserva", "Link payments, link del viaje o numero reserva ", "id_reserva", "ID Reserva"])
+    c_id_reserva = pick_col(df, ["Link payments, link del viaje o numero reserva", "Link payments, link del viaje o numero reserva "])
 
     out = pd.DataFrame()
-    out["Fecha"] = coerce_datetime(get_series(df, c_fecha)) if c_fecha else pd.NaT
-    out["Dirección de correo electrónico"] = get_series(df, c_mail_agente) if c_mail_agente else ""
-    out["Motivo"] = get_series(df, c_motivo) if c_motivo else ""
-    out["Numero"] = get_series(df, c_ticket).apply(extract_ticket_number) if c_ticket else None
-    out["Correo registrado en Cabify para realizar la carga"] = get_series(df, c_correo) if c_correo else ""
-    out["Monto_transfer"] = get_series(df, c_monto).apply(parse_clp_amount) if c_monto else 0.0
-    out["Motivo_transfer_aeropuerto"] = get_series(df, c_motivo_aerop) if c_motivo_aerop else ""
-    out["id_reserva_raw"] = get_series(df, c_id_reserva).astype(str) if c_id_reserva else ""
+    out["Fecha"] = coerce_datetime(df[c_fecha]) if c_fecha else pd.NaT
+    out["Dirección de correo electrónico"] = df[c_mail_agente] if c_mail_agente else ""
+    out["Motivo"] = df[c_motivo] if c_motivo else ""
+    out["Numero"] = df[c_ticket].apply(extract_ticket_number) if c_ticket else None
+    out["Correo registrado en Cabify para realizar la carga"] = df[c_correo] if c_correo else ""
+    out["Monto_transfer"] = df[c_monto].apply(parse_clp_amount) if c_monto else 0.0
+    out["Motivo_transfer_aeropuerto"] = df[c_motivo_aerop] if c_motivo_aerop else ""
+    out["id_reserva_raw"] = df[c_id_reserva].astype(str) if c_id_reserva else ""
     out["Fuente_transfer"] = True
 
     # filtrar solo Compensación Aeropuerto
-    if "Motivo" in out.columns:
+    if "Motivo" in out.columns and out["Motivo"].notna().any():
         out = out[out["Motivo"].astype(str).str.strip().str.lower() == "compensación aeropuerto".lower()].copy()
 
     return out
@@ -276,97 +266,106 @@ def standardize_transfer(df: pd.DataFrame) -> pd.DataFrame:
 
 def aggregate_by_ticket_saldo(df_saldo_std: pd.DataFrame) -> pd.DataFrame:
     s = df_saldo_std.copy()
-    s = s[s["Numero"].notna() & (s["Numero"].astype(str).str.strip() != "")].copy()
+    s = s[s["Numero"].notna() & (s["Numero"].astype(str).str.strip() != "")]
+    if s.empty:
+        return s
 
-    g = s.groupby("Numero", as_index=False).agg(
-        Fecha=("Fecha", min_datetime),
-        **{
-            "Dirección de correo electrónico": ("Dirección de correo electrónico", first_non_empty),
-            "Correo registrado en Cabify para realizar la carga": ("Correo registrado en Cabify para realizar la carga", first_non_empty),
-            "Monto_saldo": ("Monto_saldo", "sum"),
-            "Motivo_saldo": ("Motivo_saldo", first_non_empty),
-            "Fuente_saldo": ("Fuente_saldo", "max"),
-        }
+    agg = (
+        s.groupby("Numero", as_index=False)
+        .agg(
+            **{
+                "Fecha_saldo": ("Fecha", _min_date),
+                "Dirección de correo electrónico_saldo": ("Dirección de correo electrónico", _first_nonempty),
+                "Correo registrado en Cabify para realizar la carga_saldo": ("Correo registrado en Cabify para realizar la carga", _first_nonempty),
+                "Monto_saldo": ("Monto_saldo", "sum"),
+                "Motivo_saldo": ("Motivo_saldo", _first_nonempty),
+                "Fuente_saldo": ("Fuente_saldo", "max"),
+            }
+        )
     )
-    return g
+    return agg
 
 
 def aggregate_by_ticket_transfer(df_transf_std: pd.DataFrame) -> pd.DataFrame:
     t = df_transf_std.copy()
-    t = t[t["Numero"].notna() & (t["Numero"].astype(str).str.strip() != "")].copy()
+    t = t[t["Numero"].notna() & (t["Numero"].astype(str).str.strip() != "")]
+    if t.empty:
+        return t
 
-    g = t.groupby("Numero", as_index=False).agg(
-        Fecha=("Fecha", min_datetime),
-        **{
-            "Dirección de correo electrónico": ("Dirección de correo electrónico", first_non_empty),
-            "Correo registrado en Cabify para realizar la carga": ("Correo registrado en Cabify para realizar la carga", first_non_empty),
-            "Monto_transfer": ("Monto_transfer", "sum"),
-            "Motivo_transfer_aeropuerto": ("Motivo_transfer_aeropuerto", first_non_empty),
-            "id_reserva_raw": ("id_reserva_raw", first_non_empty),
-            "Fuente_transfer": ("Fuente_transfer", "max"),
-        }
+    agg = (
+        t.groupby("Numero", as_index=False)
+        .agg(
+            **{
+                "Fecha_transfer": ("Fecha", _min_date),
+                "Dirección de correo electrónico_transfer": ("Dirección de correo electrónico", _first_nonempty),
+                "Correo registrado en Cabify para realizar la carga_transfer": ("Correo registrado en Cabify para realizar la carga", _first_nonempty),
+                "Monto_transfer": ("Monto_transfer", "sum"),
+                "Motivo_transfer_aeropuerto": ("Motivo_transfer_aeropuerto", _first_nonempty),
+                "id_reserva": ("id_reserva_raw", _join_unique_nonempty),
+                "Fuente_transfer": ("Fuente_transfer", "max"),
+            }
+        )
     )
-    return g
+    return agg
 
 
 def build_master(df_saldo_std: pd.DataFrame, df_transf_std: pd.DataFrame) -> pd.DataFrame:
-    # 1) Agregar por ticket en cada fuente
+    # 1) agregamos por ticket para evitar duplicados y asegurar suma correcta
     s = aggregate_by_ticket_saldo(df_saldo_std)
     t = aggregate_by_ticket_transfer(df_transf_std)
 
-    # 2) Outer join por Numero
-    merged = pd.merge(s, t, on="Numero", how="outer", suffixes=("_saldo", "_transfer"))
+    # 2) outer join por ticket
+    merged = pd.merge(s, t, on="Numero", how="outer")
 
-    # 3) Fecha: mínima entre ambas (cuando exista)
-    f_s = pd.to_datetime(merged.get("Fecha_saldo"), errors="coerce")
-    f_t = pd.to_datetime(merged.get("Fecha_transfer"), errors="coerce")
-    merged["Fecha"] = pd.concat([f_s, f_t], axis=1).min(axis=1)
+    # 3) Fecha = mínima entre saldo/transfer si ambas existen
+    merged["Fecha"] = merged.get("Fecha_saldo", pd.Series([pd.NaT] * len(merged)))
+    f2 = merged.get("Fecha_transfer", pd.Series([pd.NaT] * len(merged)))
+    merged["Fecha"] = pd.to_datetime(merged["Fecha"], errors="coerce")
+    f2 = pd.to_datetime(f2, errors="coerce")
+    merged["Fecha"] = pd.concat([merged["Fecha"], f2], axis=1).min(axis=1)
 
-    # 4) Email agente: prefer saldo
+    # 4) Email agente prefer saldo
     merged["Dirección de correo electrónico"] = merged.get("Dirección de correo electrónico_saldo", "")
     merged["Dirección de correo electrónico"] = merged["Dirección de correo electrónico"].where(
         merged["Dirección de correo electrónico"].astype(str).str.strip() != "",
         merged.get("Dirección de correo electrónico_transfer", ""),
     )
 
-    # 5) Correo registrado: prefer saldo
+    # 5) Correo registrado prefer saldo
     merged["Correo registrado en Cabify para realizar la carga"] = merged.get(
         "Correo registrado en Cabify para realizar la carga_saldo", ""
     )
-    merged["Correo registrado en Cabify para realizar la carga"] = merged[
-        "Correo registrado en Cabify para realizar la carga"
-    ].where(
+    merged["Correo registrado en Cabify para realizar la carga"] = merged["Correo registrado en Cabify para realizar la carga"].where(
         merged["Correo registrado en Cabify para realizar la carga"].astype(str).str.strip() != "",
         merged.get("Correo registrado en Cabify para realizar la carga_transfer", ""),
     )
 
-    # 6) Montos
-    merged["Monto_saldo"] = pd.to_numeric(merged.get("Monto_saldo"), errors="coerce").fillna(0.0)
-    merged["Monto_transfer"] = pd.to_numeric(merged.get("Monto_transfer"), errors="coerce").fillna(0.0)
+    # 6) Montos (suma cuando existe en ambas)
+    merged["Monto_saldo"] = merged.get("Monto_saldo", 0.0).fillna(0.0)
+    merged["Monto_transfer"] = merged.get("Monto_transfer", 0.0).fillna(0.0)
     merged["Monto a compensar"] = merged["Monto_saldo"] + merged["Monto_transfer"]
 
-    # 7) Motivo unificado
+    # 7) Motivo unificado: prefer saldo, si no, motivo aeropuerto de transfer
     merged["Motivo compensación"] = merged.get("Motivo_saldo", "")
     merged["Motivo compensación"] = merged["Motivo compensación"].where(
         merged["Motivo compensación"].astype(str).str.strip() != "",
         merged.get("Motivo_transfer_aeropuerto", ""),
     )
 
-    # 8) Clasificación (incluye el caso ambos)
-    has_s = merged.get("Fuente_saldo", False)
-    has_t = merged.get("Fuente_transfer", False)
-    has_s = pd.Series(has_s).fillna(False).astype(bool)
-    has_t = pd.Series(has_t).fillna(False).astype(bool)
-
+    # 8) Clasificación
+    has_s = merged.get("Fuente_saldo", False).fillna(False).astype(bool)
+    has_t = merged.get("Fuente_transfer", False).fillna(False).astype(bool)
     merged["Clasificación"] = "Sin clasificar"
     merged.loc[has_s & ~has_t, "Clasificación"] = "Saldo (Aeropuerto)"
     merged.loc[~has_s & has_t, "Clasificación"] = "Transferencia (Aeropuerto)"
     merged.loc[has_s & has_t, "Clasificación"] = "Saldo + Transferencia (Aeropuerto)"
 
-    # 9) id_reserva: traer tal cual viene desde transferencias
-    merged["id_reserva"] = merged.get("id_reserva_raw", "")
-    merged["id_reserva"] = merged["id_reserva"].fillna("").astype(str)
+    # 9) id_reserva: traer tal cual viene desde transfer (puede ser link/id/texto)
+    if "id_reserva" not in merged.columns:
+        merged["id_reserva"] = ""
+    merged["id_reserva"] = merged["id_reserva"].fillna("")
 
+    # 10) columnas finales
     final = merged[
         [
             "Fecha",
@@ -445,7 +444,6 @@ with colB:
         key="up_transf",
     )
 
-
 st.divider()
 st.subheader("3) Validación (checksum) + Generación máster")
 
@@ -510,7 +508,6 @@ if btn:
     except Exception as e:
         st.error("Ocurrió un error generando el máster.")
         st.exception(e)
-
 
 with st.expander("Diagnóstico (por si falla la descarga desde Sheets)", expanded=False):
     st.write(
