@@ -125,11 +125,11 @@ def extract_ticket_number(x) -> str | None:
 
 def parse_clp_amount(x) -> float:
     """
-    Montos tipo:
+    Interpreta montos tipo:
       19980
       497.572  -> 497572
       14.968   -> 14968
-      $28.47   -> heurística: 28.47 * 1000 = 28470 (caso típico de Sheet/locale)
+      $28.47   -> heurística: 28.47 * 1000 = 28470
     """
     if pd.isna(x):
         return 0.0
@@ -205,72 +205,69 @@ def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     return None
 
 
-def pick_first_like(df: pd.DataFrame, base_name: str) -> str | None:
+def pick_best_monto_column(df: pd.DataFrame) -> str | None:
     """
-    Si en Excel hay columnas duplicadas, pandas suele crear 'Monto' y 'Monto.1'.
-    Esto busca base_name exacto o variantes con .1/.2 etc.
+    En la base de transferencias suelen venir 2 columnas "Monto" (pandas las nombra Monto y Monto.1).
+    Aquí elegimos la que tenga más valores útiles luego de parsear.
     """
-    base_norm = normalize_text(base_name)
+    monto_cols = []
+    for c in df.columns:
+        if normalize_text(c) == "monto" or normalize_text(c).startswith("monto."):
+            monto_cols.append(c)
+
+    # También considerar nombres parecidos, por si el sheet cambia
     for c in df.columns:
         cn = normalize_text(c)
-        if cn == base_norm:
-            return c
-    # fallback: startswith
-    for c in df.columns:
-        cn = normalize_text(c)
-        if cn.startswith(base_norm + "."):
-            return c
-    return None
+        if cn in ("monto ", "importe", "monto clp") and c not in monto_cols:
+            monto_cols.append(c)
+
+    if not monto_cols:
+        return None
+
+    best_col = None
+    best_score = -1
+
+    for c in monto_cols:
+        s = df[c]
+        parsed = s.apply(parse_clp_amount)
+        nonzero = (parsed > 0).sum()
+        notna = parsed.notna().sum()
+        total = float(parsed.fillna(0).sum())
+
+        # score: prioriza cantidad de no-cero, luego suma total, luego no-nulos
+        score = (nonzero * 1_000_000) + min(total, 9e12) + (notna * 10)
+        if score > best_score:
+            best_score = score
+            best_col = c
+
+    return best_col
 
 
-def join_unique(a, b) -> str:
+def merge_two_text_values(a, b) -> str:
     """
-    Une dos valores (posibles NaN) en un solo string, sin duplicados.
+    Une valores texto a y b en un string único.
+    - Si uno está vacío -> devuelve el otro
+    - Si son distintos -> "a | b" (sin duplicados)
     """
-    vals = []
-    for v in [a, b]:
-        if v is None:
-            continue
-        if isinstance(v, float) and pd.isna(v):
-            continue
-        s = str(v).strip()
-        if s == "" or s.lower() == "nan":
-            continue
-        vals.append(s)
-    # unique preserving order
-    out = []
-    seen = set()
-    for s in vals:
-        key = s.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(s)
-    return " | ".join(out) if out else ""
+    a = "" if a is None or (isinstance(a, float) and pd.isna(a)) else str(a).strip()
+    b = "" if b is None or (isinstance(b, float) and pd.isna(b)) else str(b).strip()
 
+    if a == "" and b == "":
+        return ""
+    if a == "":
+        return b
+    if b == "":
+        return a
 
-def agg_unique_join(series: pd.Series) -> str:
-    vals = []
-    for v in series.dropna().tolist():
-        s = str(v).strip()
-        if s == "" or s.lower() == "nan":
-            continue
-        vals.append(s)
-    out = []
-    seen = set()
-    for s in vals:
-        key = s.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(s)
-    return " | ".join(out) if out else ""
+    if normalize_text(a) == normalize_text(b):
+        return a
 
-
-def first_non_empty(series: pd.Series) -> str:
-    for v in series.dropna().tolist():
-        s = str(v).strip()
-        if s != "" and s.lower() != "nan":
-            return s
-    return ""
+    # evitar duplicados exactos
+    parts = []
+    for x in [a, b]:
+        if x and x not in parts:
+            parts.append(x)
+    return " | ".join(parts)
 
 
 def standardize_saldo(df: pd.DataFrame) -> pd.DataFrame:
@@ -286,7 +283,7 @@ def standardize_saldo(df: pd.DataFrame) -> pd.DataFrame:
     out["Agente_saldo"] = df[c_mail_agente] if c_mail_agente else ""
     out["Numero"] = df[c_ticket].apply(extract_ticket_number) if c_ticket else None
     out["Cliente_saldo"] = df[c_mail_carga] if c_mail_carga else ""
-    out["Monto_saldo"] = df[c_monto].apply(parse_clp_amount) if c_monto else 0.0
+    out["Monto Saldo"] = df[c_monto].apply(parse_clp_amount) if c_monto else 0.0
     out["Motivo_saldo"] = df[c_motivo] if c_motivo else ""
     out["Fuente_saldo"] = True
     return out
@@ -296,16 +293,13 @@ def standardize_transfer(df: pd.DataFrame) -> pd.DataFrame:
     c_fecha = pick_col(df, ["Marca temporal", "Timestamp", "Fecha", "fecha"])
     c_mail_agente = pick_col(df, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email", "Agente"])
     c_motivo = pick_col(df, ["Motivo"])
-
-    # Puede existir "Monto" duplicado (Monto, Monto.1)
-    c_monto = pick_first_like(df, "Monto") or pick_col(df, ["Monto"])
-
     c_correo = pick_col(df, ["Correo", "Correo registrado", "Email pasajero"])
-    c_ticket = pick_col(df, ["Ticket", "Numero ticket", "Número ticket", "Numero de ticket"])
+    c_ticket = pick_col(df, ["Ticket", "Numero ticket", "Número ticket"])
     c_motivo_aerop = pick_col(df, ["Si es compensación Aeropuerto selecciona el motivo", "Si es compensacion Aeropuerto selecciona el motivo"])
+    c_id_reserva = pick_col(df, ["Link payments, link del viaje o numero reserva", "Link payments, link del viaje o número reserva", "Link payments, link del viaje", "id_reserva", "Id reserva"])
 
-    # id_reserva (tal cual viene)
-    c_id_reserva = pick_col(df, ["Link payments, link del viaje o numero reserva", "Link payments, link del viaje o numero reserva ", "Link payments", "Link del viaje o numero reserva"])
+    # Monto: elegir mejor columna de monto (evita el problema del 0)
+    c_monto_best = pick_best_monto_column(df)
 
     out = pd.DataFrame()
     out["Fecha"] = coerce_datetime(df[c_fecha]) if c_fecha else pd.NaT
@@ -313,98 +307,72 @@ def standardize_transfer(df: pd.DataFrame) -> pd.DataFrame:
     out["Motivo"] = df[c_motivo] if c_motivo else ""
     out["Numero"] = df[c_ticket].apply(extract_ticket_number) if c_ticket else None
     out["Cliente_transfer"] = df[c_correo] if c_correo else ""
-    out["Monto_transfer"] = df[c_monto].apply(parse_clp_amount) if c_monto else 0.0
+    out["Monto Transferencia"] = df[c_monto_best].apply(parse_clp_amount) if c_monto_best else 0.0
     out["Motivo_transfer_aeropuerto"] = df[c_motivo_aerop] if c_motivo_aerop else ""
-    out["id_reserva"] = df[c_id_reserva] if c_id_reserva else ""
+    out["id_reserva_raw"] = df[c_id_reserva] if c_id_reserva else ""
     out["Fuente_transfer"] = True
 
-    # Filtrar solo Compensación Aeropuerto
-    if "Motivo" in out.columns:
+    # filtrar solo Compensación Aeropuerto
+    if "Motivo" in out.columns and out["Motivo"].notna().any():
         out = out[out["Motivo"].astype(str).str.strip().str.lower() == "compensación aeropuerto".lower()].copy()
 
     return out
 
 
-def aggregate_by_ticket_saldo(s: pd.DataFrame) -> pd.DataFrame:
-    s = s.copy()
-    s = s[s["Numero"].notna() & (s["Numero"].astype(str).str.strip() != "")]
-    # asegurar tipos
-    s["Monto_saldo"] = pd.to_numeric(s["Monto_saldo"], errors="coerce").fillna(0.0)
-
-    g = s.groupby("Numero", as_index=False).agg(
-        Fecha_saldo=("Fecha", "min"),
-        Agente_saldo=("Agente_saldo", agg_unique_join),
-        Cliente_saldo=("Cliente_saldo", agg_unique_join),
-        Monto_saldo=("Monto_saldo", "sum"),
-        Motivo_saldo=("Motivo_saldo", first_non_empty),
-        Fuente_saldo=("Fuente_saldo", "max"),
-    )
-    return g
-
-
-def aggregate_by_ticket_transfer(t: pd.DataFrame) -> pd.DataFrame:
-    t = t.copy()
-    t = t[t["Numero"].notna() & (t["Numero"].astype(str).str.strip() != "")]
-    t["Monto_transfer"] = pd.to_numeric(t["Monto_transfer"], errors="coerce").fillna(0.0)
-
-    g = t.groupby("Numero", as_index=False).agg(
-        Fecha_transfer=("Fecha", "min"),
-        Agente_transfer=("Agente_transfer", agg_unique_join),
-        Cliente_transfer=("Cliente_transfer", agg_unique_join),
-        Monto_transfer=("Monto_transfer", "sum"),
-        Motivo_transfer_aeropuerto=("Motivo_transfer_aeropuerto", first_non_empty),
-        id_reserva=("id_reserva", agg_unique_join),
-        Fuente_transfer=("Fuente_transfer", "max"),
-    )
-    return g
-
-
 def build_master(df_saldo_std: pd.DataFrame, df_transf_std: pd.DataFrame) -> pd.DataFrame:
-    s = aggregate_by_ticket_saldo(df_saldo_std)
-    t = aggregate_by_ticket_transfer(df_transf_std)
+    s = df_saldo_std.copy()
+    t = df_transf_std.copy()
 
-    merged = pd.merge(s, t, on="Numero", how="outer")
+    s = s[s["Numero"].notna() & (s["Numero"].astype(str).str.strip() != "")]
+    t = t[t["Numero"].notna() & (t["Numero"].astype(str).str.strip() != "")]
 
-    # Fecha: mínima no nula entre ambas
-    f1 = pd.to_datetime(merged.get("Fecha_saldo"), errors="coerce")
-    f2 = pd.to_datetime(merged.get("Fecha_transfer"), errors="coerce")
-    merged["Fecha"] = f1
-    merged["Fecha"] = merged["Fecha"].where(merged["Fecha"].notna(), f2)
-    merged["Fecha"] = pd.concat([f1, f2], axis=1).min(axis=1)
-
-    # Correo agente (relación saldo vs transfer): si distintos, dejar ambos
-    merged["Dirección de correo electrónico"] = merged.apply(
-        lambda r: join_unique(r.get("Agente_saldo", ""), r.get("Agente_transfer", "")),
-        axis=1,
+    merged = pd.merge(
+        s,
+        t,
+        on="Numero",
+        how="outer",
+        suffixes=("_saldo", "_transfer"),
     )
 
-    # Correo cliente (Correo vs Correo registrado...): si distintos, dejar ambos
-    merged["Correo registrado en Cabify para realizar la carga"] = merged.apply(
-        lambda r: join_unique(r.get("Cliente_saldo", ""), r.get("Cliente_transfer", "")),
-        axis=1,
-    )
+    # Fecha (min entre ambas no nulas)
+    merged["Fecha_saldo"] = pd.to_datetime(merged.get("Fecha_saldo"), errors="coerce")
+    merged["Fecha_transfer"] = pd.to_datetime(merged.get("Fecha_transfer"), errors="coerce")
+    merged["Fecha"] = merged[["Fecha_saldo", "Fecha_transfer"]].min(axis=1)
 
-    # Montos separados + total
-    merged["Monto Saldo"] = pd.to_numeric(merged.get("Monto_saldo"), errors="coerce").fillna(0.0)
-    merged["Monto Transferencia"] = pd.to_numeric(merged.get("Monto_transfer"), errors="coerce").fillna(0.0)
+    # Agente (unir si difieren)
+    a_s = merged.get("Agente_saldo", "")
+    a_t = merged.get("Agente_transfer", "")
+    merged["Dirección de correo electrónico"] = [
+        merge_two_text_values(x, y) for x, y in zip(a_s, a_t)
+    ]
+
+    # Cliente (unir si difieren)
+    c_s = merged.get("Cliente_saldo", "")
+    c_t = merged.get("Cliente_transfer", "")
+    merged["Correo registrado en Cabify para realizar la carga"] = [
+        merge_two_text_values(x, y) for x, y in zip(c_s, c_t)
+    ]
+
+    # Montos (columnas separadas + total)
+    merged["Monto Saldo"] = pd.to_numeric(merged.get("Monto Saldo", 0.0), errors="coerce").fillna(0.0)
+    merged["Monto Transferencia"] = pd.to_numeric(merged.get("Monto Transferencia", 0.0), errors="coerce").fillna(0.0)
     merged["Total Compensación"] = merged["Monto Saldo"] + merged["Monto Transferencia"]
 
-    # Motivo unificado: prefer saldo, si no, motivo aeropuerto de transfer
+    # Motivo unificado: prefer saldo, si no, usar motivo aeropuerto de transfer
     merged["Motivo compensación"] = merged.get("Motivo_saldo", "")
-    merged["Motivo compensación"] = merged["Motivo compensación"].where(
-        merged["Motivo compensación"].astype(str).str.strip() != "",
-        merged.get("Motivo_transfer_aeropuerto", ""),
-    )
+    ms = merged["Motivo compensación"].astype(str).str.strip()
+    fallback = merged.get("Motivo_transfer_aeropuerto", "")
+    merged.loc[(ms == "") | (ms.str.lower() == "nan"), "Motivo compensación"] = fallback
 
-    # id_reserva (tal cual; si no existe, vacío)
-    merged["id_reserva"] = merged.get("id_reserva", "")
-    merged["id_reserva"] = merged["id_reserva"].fillna("").astype(str)
+    # id_reserva: traer tal cual (prefer transferencia si existe)
+    idr = merged.get("id_reserva_raw", "")
+    merged["id_reserva"] = idr.fillna("").astype(str)
 
     # Clasificación
     has_s = merged.get("Fuente_saldo", False)
     has_t = merged.get("Fuente_transfer", False)
-    has_s = has_s.fillna(False) if isinstance(has_s, pd.Series) else False
-    has_t = has_t.fillna(False) if isinstance(has_t, pd.Series) else False
+    has_s = pd.Series(has_s).fillna(False).astype(bool)
+    has_t = pd.Series(has_t).fillna(False).astype(bool)
 
     merged["Clasificación"] = "Sin clasificar"
     merged.loc[has_s & ~has_t, "Clasificación"] = "Saldo (Aeropuerto)"
@@ -463,7 +431,7 @@ with colA:
     up_saldo = st.file_uploader(
         "📤 Cargar archivo local de Carga de Saldo (xlsx/csv)",
         type=["xlsx", "xls", "csv"],
-        key="up_saldo",
+        key="up_saldo"
     )
 
 with colB:
@@ -488,13 +456,12 @@ with colB:
     up_transf = st.file_uploader(
         "📤 Cargar archivo local de Transferencias (xlsx/csv)",
         type=["xlsx", "xls", "csv"],
-        key="up_transf",
+        key="up_transf"
     )
 
 
 st.divider()
 st.subheader("3) Validación (checksum) + Generación máster")
-
 
 def checksum_block(label: str, uploaded_file, dl_info: dict):
     if uploaded_file is None:
@@ -534,6 +501,7 @@ if btn:
     try:
         df_saldo_std = standardize_saldo(df_saldo_in)
         df_transf_std = standardize_transfer(df_transf_in)
+
         master = build_master(df_saldo_std, df_transf_std)
 
         st.success(f"Máster generado: {len(master):,} tickets únicos.")
@@ -563,5 +531,8 @@ with st.expander("Diagnóstico (por si falla la descarga desde Sheets)", expande
         "- Si ves **HTTPError** en Streamlit Cloud al intentar descargar, casi siempre es por permisos.\n"
         "- Verifica que cada Google Sheet esté compartido como **Cualquiera con el enlace: Lector**.\n"
         "- Si está restringido a tu organización, Google puede devolver HTML/login y la app lo bloqueará.\n"
-        "- Aun así, puedes usar **carga local** y el máster se generará igual."
+        "- Aun así, puedes usar **carga local** y el máster se generará igual.\n"
+        "- Si el **Monto Transferencia** volviera a 0, revisa en la hoja si cambió el nombre de columnas; "
+        "esta versión intenta elegir automáticamente la mejor columna 'Monto' (incluyendo 'Monto.1')."
     )
+
