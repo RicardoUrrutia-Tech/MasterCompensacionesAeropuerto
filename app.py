@@ -1,9 +1,9 @@
 import io
 import re
+import json
 import hashlib
 from datetime import datetime
 
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -12,567 +12,485 @@ import streamlit as st
 # =========================
 # Config
 # =========================
-st.set_page_config(page_title="Máster de Compensaciones", layout="wide")
+st.set_page_config(page_title="Máster Compensaciones Aeropuerto", layout="wide")
 
-SHEET_SALDO_URL = "https://docs.google.com/spreadsheets/d/1Yj8q2dnlKqIZ1-vdr7wZZp_jvXiLoYO6Qwc8NeIeUnE/edit?gid=1139202449#gid=1139202449"
-SHEET_TRANSF_URL = "https://docs.google.com/spreadsheets/d/1yHTfTOD-N8VYBSzQRCkaNpMpAQHykBzVB5mYsXS6rHs/edit?resourcekey=&gid=1627777729#gid=1627777729"
+SALDO_SHEET_URL = "https://docs.google.com/spreadsheets/d/1Yj8q2dnlKqIZ1-vdr7wZZp_jvXiLoYO6Qwc8NeIeUnE/edit?gid=1139202449#gid=1139202449"
+SALDO_SHEET_ID = "1Yj8q2dnlKqIZ1-vdr7wZZp_jvXiLoYO6Qwc8NeIeUnE"
+SALDO_GID = "1139202449"
+
+TRANSF_SHEET_URL = "https://docs.google.com/spreadsheets/d/1yHTfTOD-N8VYBSzQRCkaNpMpAQHykBzVB5mYsXS6rHs/edit?resourcekey=&gid=1627777729#gid=1627777729"
+TRANSF_SHEET_ID = "1yHTfTOD-N8VYBSzQRCkaNpMpAQHykBzVB5mYsXS6rHs"
+TRANSF_GID = "1627777729"
 
 
 # =========================
-# Helpers (Sheets download + checksum)
+# Helpers
 # =========================
-def parse_sheet_id_and_gid(sheet_url: str):
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
-    if not m:
-        return None, None
-    sheet_id = m.group(1)
-    gid = None
-    mgid = re.search(r"gid=([0-9]+)", sheet_url)
-    if mgid:
-        gid = mgid.group(1)
-    return sheet_id, gid
-
-
-def build_export_xlsx_url(sheet_url: str) -> str:
-    sheet_id, gid = parse_sheet_id_and_gid(sheet_url)
-    if not sheet_id:
-        raise ValueError("No pude extraer el sheet_id desde el link.")
-    # xlsx export (gid opcional, pero lo incluimos para apuntar a la pestaña)
-    if gid:
-        return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx&gid={gid}"
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-
-
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def fetch_bytes(url: str, timeout: int = 60) -> bytes:
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.content
-
-
-def read_excel_from_bytes(b: bytes) -> pd.DataFrame:
-    bio = io.BytesIO(b)
-    return pd.read_excel(bio, engine="openpyxl")
-
-
-def safe_strip(s):
-    if pd.isna(s):
-        return None
-    if isinstance(s, str):
-        t = s.strip()
-        return t if t else None
+def normalize_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = s.strip().lower()
+    # normalización simple sin dependencias extras
+    repl = {
+        "á": "a", "é": "e", "í": "i", "ó": "o", "ú": "u",
+        "ñ": "n", "ü": "u"
+    }
+    for k, v in repl.items():
+        s = s.replace(k, v)
+    s = re.sub(r"\s+", " ", s)
     return s
 
 
-# =========================
-# Normalización de Ticket
-# =========================
-def normalize_ticket(value) -> str | None:
+def build_export_urls(sheet_id: str, gid: str) -> dict:
+    # XLSX export (mejor para conservar valores numéricos reales)
+    xlsx = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx&gid={gid}"
+    # CSV fallback (a veces más permisivo)
+    csv = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={gid}"
+    return {"xlsx": xlsx, "csv": csv}
+
+
+def fetch_bytes(url: str, timeout: int = 30) -> bytes:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; MasterCompensaciones/1.0)",
+        "Accept": "*/*",
+    }
+    r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    r.raise_for_status()
+
+    # Si Google redirige a login, usualmente devuelve HTML
+    ctype = (r.headers.get("Content-Type") or "").lower()
+    if "text/html" in ctype and len(r.content) > 5000:
+        # Heurística: export bloqueado o login
+        raise requests.HTTPError(
+            "Google devolvió HTML (posible bloqueo por permisos / login). "
+            "Asegura que el Sheet esté compartido como 'Cualquiera con el enlace: Lector'."
+        )
+    return r.content
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def download_sheet_bytes(sheet_id: str, gid: str) -> dict:
     """
-    Acepta:
-      - 66185638
-      - #66185638
-      - https://cabify.zendesk.com/agent/tickets/67587605 (toma lo último tras /)
-    Devuelve solo dígitos (string) o None.
+    Intenta XLSX primero, luego CSV.
+    Devuelve dict con:
+      - kind: 'xlsx'|'csv'
+      - bytes: b'...'
+      - sha256: '...'
+      - error: str|None
     """
-    if pd.isna(value):
+    urls = build_export_urls(sheet_id, gid)
+
+    # intento XLSX
+    try:
+        b = fetch_bytes(urls["xlsx"])
+        return {"kind": "xlsx", "bytes": b, "sha256": sha256_bytes(b), "error": None, "url": urls["xlsx"]}
+    except Exception as e_xlsx:
+        # fallback CSV
+        try:
+            b = fetch_bytes(urls["csv"])
+            return {"kind": "csv", "bytes": b, "sha256": sha256_bytes(b), "error": None, "url": urls["csv"]}
+        except Exception as e_csv:
+            return {
+                "kind": None,
+                "bytes": None,
+                "sha256": None,
+                "error": f"Falló XLSX: {type(e_xlsx).__name__}: {e_xlsx} | Falló CSV: {type(e_csv).__name__}: {e_csv}",
+                "url": None,
+            }
+
+
+def read_uploaded_file(uploaded_file) -> tuple[pd.DataFrame, bytes, str]:
+    b = uploaded_file.getvalue()
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(io.BytesIO(b))
+    else:
+        # xlsx/xls
+        df = pd.read_excel(io.BytesIO(b), engine="openpyxl")
+    return df, b, sha256_bytes(b)
+
+
+def coerce_datetime(series: pd.Series) -> pd.Series:
+    # soporte dd/mm/yyyy hh:mm:ss (Chile) y otros
+    return pd.to_datetime(series, errors="coerce", dayfirst=True)
+
+
+def extract_ticket_number(x) -> str | None:
+    if pd.isna(x):
         return None
-    s = str(value).strip()
+    s = str(x).strip()
 
-    if not s:
-        return None
+    # si es link, tomar lo que viene después del último "/"
+    if s.startswith("http://") or s.startswith("https://"):
+        last = s.rstrip("/").split("/")[-1]
+        # por si trae querystring
+        last = last.split("?")[0].strip()
+        # quedarse con dígitos si aplica
+        m = re.search(r"(\d+)", last)
+        return m.group(1) if m else last
 
-    # Si es URL, toma el último tramo
-    if "http://" in s or "https://" in s:
-        s = s.rstrip("/")
-        s = s.split("/")[-1]
-
-    # Quitar #
+    # si viene con '#'
     s = s.replace("#", "").strip()
 
-    # Extraer dígitos
-    m = re.search(r"(\d+)", s)
-    return m.group(1) if m else None
+    # si viene con texto raro, rescatar solo dígitos largos
+    m = re.search(r"(\d{5,})", s)
+    if m:
+        return m.group(1)
+
+    # último recurso: dígitos cualquiera
+    m2 = re.search(r"(\d+)", s)
+    return m2.group(1) if m2 else s
 
 
-# =========================
-# Normalización de Monto
-# =========================
-def parse_amount(value) -> float | None:
+def parse_clp_amount(x) -> float:
     """
-    Intenta convertir montos con distintos formatos:
-    - "19980"
-    - "14.968" => 14968 (punto como miles)
-    - "497.572" => 497572
-    - "$28.47" (pero en sheet a veces es 28.471) => heurística a 28471
-    - números (float/int) exportados desde xlsx
-
-    Retorna float (idealmente entero en CLP) o None.
+    Intenta interpretar montos tipo:
+      19980
+      497.572  -> 497572
+      14.968   -> 14968
+      $28.47   -> heurística: 28.47 * 1000 = 28470 (caso típico de Sheet/locale)
     """
-    if pd.isna(value):
-        return None
+    if pd.isna(x):
+        return 0.0
 
-    # Caso numérico ya parseado por Excel
-    if isinstance(value, (int, np.integer)):
-        return float(value)
+    # si ya es número
+    if isinstance(x, (int, float)) and pd.notna(x):
+        return float(x)
 
-    if isinstance(value, (float, np.floating)):
-        v = float(value)
-        if np.isnan(v):
-            return None
-        # Heurística: si viene con 3 decimales y es "pequeño", suele ser miles mal formateados (28.471 -> 28471)
-        # Ej: 28.471, 14.968, 497.572
-        frac = abs(v - round(v))
-        # Detectar "tres decimales relevantes"
-        if v < 1000 and frac > 0 and round(v, 3) == v:
-            return float(round(v * 1000))
-        # Si es grande con 3 decimales (poco probable como CLP), igual lo tratamos como miles si termina en 3 decimales exactos
-        if v >= 1000 and round(v, 3) == v and frac > 0:
-            return float(round(v * 1000))
-        return float(round(v))
+    s_raw = str(x).strip()
+    if s_raw == "":
+        return 0.0
 
-    # Caso string
-    s = str(value).strip()
-    if not s:
-        return None
+    has_dollar = "$" in s_raw
+    s = s_raw.replace("$", "").replace("CLP", "").replace(" ", "").strip()
 
-    # Quitar símbolos y espacios
-    s = s.replace("$", "").replace("CLP", "").replace("clp", "").replace(" ", "")
+    # Detectar separadores
+    has_dot = "." in s
+    has_comma = "," in s
 
-    # Si tiene coma y punto: asumimos coma decimal y punto miles (formato común)
-    # "1.234,56" -> 1234.56
-    if "," in s and "." in s:
-        s2 = s.replace(".", "").replace(",", ".")
-        try:
-            return float(s2)
-        except Exception:
-            pass
-
-    # Si tiene solo coma: puede ser decimal -> "1234,5" => 1234.5
-    if "," in s and "." not in s:
-        try:
-            return float(s.replace(",", "."))
-        except Exception:
-            pass
-
-    # Si tiene solo puntos: normalmente miles -> "14.968" => 14968
-    # pero también puede ser "28.47" que en realidad era "28.471" en el sheet.
-    if "." in s and "," not in s:
+    # Caso $28.47 (visual) -> suele significar 28.471 en barra de fórmulas (miles).
+    # Heurística: si viene con $ y tiene exactamente 2 decimales y parte entera corta, multiplicar por 1000.
+    if has_dollar and has_dot and (not has_comma):
         parts = s.split(".")
-        if len(parts) == 2 and len(parts[1]) == 2:
-            # Caso raro tipo 28.47 -> lo interpretamos como 28470 aprox? (pero tú indicas que era 28.471 -> 28471).
-            # Heurística: multiplicar por 1000 y redondear
+        if len(parts) == 2 and len(parts[1]) == 2 and len(parts[0]) <= 2:
             try:
                 v = float(s)
-                return float(round(v * 1000))
+                return float(int(round(v * 1000)))
             except Exception:
                 pass
 
-        # Miles: remover puntos
+    # Si solo tiene puntos: asumir miles -> remover puntos
+    if has_dot and not has_comma:
         s2 = s.replace(".", "")
-        if s2.isdigit():
-            return float(s2)
-
-        # fallback
+        s2 = re.sub(r"[^\d\-]", "", s2)
         try:
-            v = float(s)
-            # si quedó decimal con 3 decimales, miles
-            if round(v, 3) == v and (abs(v - round(v)) > 0):
-                return float(round(v * 1000))
-            return float(round(v))
+            return float(s2) if s2 != "" else 0.0
         except Exception:
-            return None
+            return 0.0
 
-    # Solo dígitos
-    if s.isdigit():
-        return float(s)
-
-    # Último intento: extraer número
-    m = re.search(r"(\d+(?:\.\d+)?)", s)
-    if m:
+    # Si solo tiene coma: a veces decimal, pero montos suelen ser enteros -> remover coma
+    if has_comma and not has_dot:
+        s2 = s.replace(",", "")
+        s2 = re.sub(r"[^\d\-]", "", s2)
         try:
-            v = float(m.group(1))
-            return float(round(v))
+            return float(s2) if s2 != "" else 0.0
         except Exception:
-            return None
+            return 0.0
 
-    return None
+    # Si tiene ambos: decidir por último separador
+    if has_dot and has_comma:
+        last_dot = s.rfind(".")
+        last_comma = s.rfind(",")
+        if last_comma > last_dot:
+            # coma decimal: quitar miles (.) y cambiar coma por punto
+            s2 = s.replace(".", "").replace(",", ".")
+            s2 = re.sub(r"[^\d\.\-]", "", s2)
+        else:
+            # punto decimal: quitar comas miles
+            s2 = s.replace(",", "")
+            s2 = re.sub(r"[^\d\.\-]", "", s2)
+        try:
+            return float(s2) if s2 != "" else 0.0
+        except Exception:
+            return 0.0
+
+    # fallback
+    s2 = re.sub(r"[^\d\-]", "", s)
+    try:
+        return float(s2) if s2 != "" else 0.0
+    except Exception:
+        return 0.0
 
 
-# =========================
-# Column mapping
-# =========================
 def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    cols = list(df.columns)
-    lower = {str(c).strip().lower(): c for c in cols}
+    cols_norm = {normalize_text(c): c for c in df.columns}
     for cand in candidates:
-        k = cand.strip().lower()
-        if k in lower:
-            return lower[k]
+        c_norm = normalize_text(cand)
+        if c_norm in cols_norm:
+            return cols_norm[c_norm]
     return None
 
 
-def coalesce_cols(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """
-    Soporta duplicados tipo 'Monto' y 'Monto.1'
-    """
-    cols = list(df.columns)
-    lc = [str(c).strip().lower() for c in cols]
-    for cand in candidates:
-        base = cand.strip().lower()
-        # match exact
-        for i, c in enumerate(lc):
-            if c == base:
-                return cols[i]
-        # match startswith for duplicates (monto.1)
-        for i, c in enumerate(lc):
-            if c.startswith(base + "."):
-                return cols[i]
-    return None
-
-
-# =========================
-# Transform: Saldo
-# =========================
-def transform_saldo(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = df_raw.copy()
-
-    # Intentar detectar columnas esperadas
-    col_fecha = coalesce_cols(df, ["Marca temporal", "Fecha", "Timestamp"])
-    col_agent = coalesce_cols(df, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email"])
-    col_ticket = coalesce_cols(df, ["Numero ticket", "Número ticket", "Ticket", "Numero", "N° ticket"])
-    col_correo_carga = coalesce_cols(df, ["Correo registrado en Cabify para realizar la carga", "Correo registrado", "Correo"])
-    col_monto = coalesce_cols(df, ["Monto a compensar", "Monto", "Monto a compensar "])
-    col_motivo = coalesce_cols(df, ["Motivo compensación", "Motivo compensacion", "Motivo"])
-
-    missing = [("Fecha", col_fecha), ("Email agente", col_agent), ("Ticket", col_ticket), ("Correo carga", col_correo_carga), ("Monto", col_monto), ("Motivo", col_motivo)]
-    miss_names = [n for n, c in missing if c is None]
-    if miss_names:
-        raise ValueError(f"[Saldo] No pude identificar estas columnas: {', '.join(miss_names)}. Revisa encabezados del archivo.")
+def standardize_saldo(df: pd.DataFrame) -> pd.DataFrame:
+    # candidatos basados en tu descripción
+    c_fecha = pick_col(df, ["Marca temporal", "Timestamp", "Fecha", "fecha"])
+    c_mail_agente = pick_col(df, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email", "Agente"])
+    c_ticket = pick_col(df, ["Numero ticket", "Número ticket", "Nº ticket", "Ticket", "Numero de ticket"])
+    c_mail_carga = pick_col(df, ["Correo registrado en Cabify para realizar la carga", "Correo registrado", "Correo", "Mail"])
+    c_monto = pick_col(df, ["Monto a compensar", "Monto", "Importe"])
+    c_motivo = pick_col(df, ["Motivo compensación", "Motivo compensacion", "Motivo"])
 
     out = pd.DataFrame()
-    out["Fecha"] = pd.to_datetime(df[col_fecha], errors="coerce", dayfirst=True)
-    out["Dirección de correo electrónico"] = df[col_agent].map(safe_strip)
-    out["Numero"] = df[col_ticket].map(normalize_ticket)
-    out["Correo registrado en Cabify para realizar la carga"] = df[col_correo_carga].map(safe_strip)
-    out["Monto_saldo"] = df[col_monto].map(parse_amount)
-    out["Motivo_saldo"] = df[col_motivo].map(safe_strip)
-
+    out["Fecha"] = coerce_datetime(df[c_fecha]) if c_fecha else pd.NaT
+    out["Dirección de correo electrónico"] = df[c_mail_agente] if c_mail_agente else None
+    out["Numero"] = df[c_ticket].apply(extract_ticket_number) if c_ticket else None
+    out["Correo registrado en Cabify para realizar la carga"] = df[c_mail_carga] if c_mail_carga else None
+    out["Monto_saldo"] = df[c_monto].apply(parse_clp_amount) if c_monto else 0.0
+    out["Motivo_saldo"] = df[c_motivo] if c_motivo else None
     out["Fuente_saldo"] = True
     return out
 
 
-# =========================
-# Transform: Transferencia (filtrada a Aeropuerto)
-# =========================
-def transform_transfer(df_raw: pd.DataFrame) -> pd.DataFrame:
-    df = df_raw.copy()
-
-    col_fecha = coalesce_cols(df, ["Fecha", "Marca temporal", "Timestamp"])
-    col_agent = coalesce_cols(df, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email"])
-    col_motivo = coalesce_cols(df, ["Motivo"])
-    col_motivo_aeropuerto = coalesce_cols(df, ["Si es compensación Aeropuerto selecciona el motivo", "Si es compensacion Aeropuerto selecciona el motivo"])
-    col_correo_cliente = coalesce_cols(df, ["Correo"])
-    col_ticket = coalesce_cols(df, ["Ticket"])
-
-    # Montos: por duplicados, preferimos "Monto.1" si existe
-    col_monto = None
-    # Primero intenta el duplicado (Monto.1)
-    for c in df.columns:
-        if str(c).strip().lower() == "monto.1":
-            col_monto = c
-            break
-    if col_monto is None:
-        col_monto = coalesce_cols(df, ["Monto"])
-
-    missing = [("Fecha", col_fecha), ("Email agente", col_agent), ("Motivo", col_motivo),
-               ("Motivo Aeropuerto", col_motivo_aeropuerto), ("Correo", col_correo_cliente),
-               ("Ticket", col_ticket), ("Monto", col_monto)]
-    miss_names = [n for n, c in missing if c is None]
-    if miss_names:
-        raise ValueError(f"[Transferencia] No pude identificar estas columnas: {', '.join(miss_names)}. Revisa encabezados del archivo.")
-
-    # Filtrar motivo = Compensación Aeropuerto
-    df_f = df[df[col_motivo].astype(str).str.strip().str.lower() == "compensación aeropuerto".lower()].copy()
+def standardize_transfer(df: pd.DataFrame) -> pd.DataFrame:
+    c_fecha = pick_col(df, ["Marca temporal", "Timestamp", "Fecha", "fecha"])
+    c_mail_agente = pick_col(df, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email", "Agente"])
+    c_motivo = pick_col(df, ["Motivo"])
+    c_monto = pick_col(df, ["Monto"])  # puede haber 2; tomamos el primero si existe
+    c_correo = pick_col(df, ["Correo", "Correo registrado", "Email pasajero"])
+    c_ticket = pick_col(df, ["Ticket", "Numero ticket", "Número ticket"])
+    c_motivo_aerop = pick_col(df, ["Si es compensación Aeropuerto selecciona el motivo", "Si es compensacion Aeropuerto selecciona el motivo"])
 
     out = pd.DataFrame()
-    out["Fecha"] = pd.to_datetime(df_f[col_fecha], errors="coerce", dayfirst=True)
-    out["Dirección de correo electrónico"] = df_f[col_agent].map(safe_strip)
-    out["Numero"] = df_f[col_ticket].map(normalize_ticket)
-    out["Correo registrado en Cabify para realizar la carga"] = df_f[col_correo_cliente].map(safe_strip)  # lo usamos como "correo" cliente
-    out["Monto_transferencia"] = df_f[col_monto].map(parse_amount)
-    # Unificar motivo aeropuerto hacia "Motivo compensación"
-    out["Motivo_transferencia"] = df_f[col_motivo_aeropuerto].map(safe_strip)
+    out["Fecha"] = coerce_datetime(df[c_fecha]) if c_fecha else pd.NaT
+    out["Dirección de correo electrónico"] = df[c_mail_agente] if c_mail_agente else None
+    out["Motivo"] = df[c_motivo] if c_motivo else None
+    out["Numero"] = df[c_ticket].apply(extract_ticket_number) if c_ticket else None
+    out["Correo registrado en Cabify para realizar la carga"] = df[c_correo] if c_correo else None
+    out["Monto_transfer"] = df[c_monto].apply(parse_clp_amount) if c_monto else 0.0
+    out["Motivo_transfer_aeropuerto"] = df[c_motivo_aerop] if c_motivo_aerop else None
+    out["Fuente_transfer"] = True
 
-    out["Fuente_transferencia"] = True
+    # filtrar solo Compensación Aeropuerto
+    if "Motivo" in out.columns and out["Motivo"].notna().any():
+        out = out[out["Motivo"].astype(str).str.strip().str.lower() == "compensación aeropuerto".lower()].copy()
+
     return out
 
 
-# =========================
-# Unificación / Master
-# =========================
-def build_master(df_saldo: pd.DataFrame, df_transf: pd.DataFrame) -> pd.DataFrame:
-    # Asegurar columnas mínimas
-    for c in ["Numero"]:
-        if c not in df_saldo.columns or c not in df_transf.columns:
-            raise ValueError("Falta columna Numero luego de transformar.")
+def build_master(df_saldo_std: pd.DataFrame, df_transf_std: pd.DataFrame) -> pd.DataFrame:
+    # Agrupar por ticket (Numero)
+    s = df_saldo_std.copy()
+    t = df_transf_std.copy()
 
-    # Merge outer por ticket
-    m = pd.merge(
-        df_saldo,
-        df_transf,
+    # Para evitar tickets vacíos
+    s = s[s["Numero"].notna() & (s["Numero"].astype(str).str.strip() != "")]
+    t = t[t["Numero"].notna() & (t["Numero"].astype(str).str.strip() != "")]
+
+    # Unir por ticket (outer)
+    merged = pd.merge(
+        s,
+        t,
         on="Numero",
         how="outer",
-        suffixes=("_saldo", "_transf"),
+        suffixes=("_saldo", "_transfer"),
     )
 
-    # Fecha: tomar mínima (más antigua) entre ambas
-    m["Fecha"] = pd.to_datetime(m[["Fecha_saldo", "Fecha_transf"]].min(axis=1), errors="coerce")
+    # Fecha: mínima no nula entre ambas
+    merged["Fecha"] = pd.to_datetime(merged["Fecha_saldo"], errors="coerce")
+    f2 = pd.to_datetime(merged["Fecha_transfer"], errors="coerce")
+    merged["Fecha"] = merged["Fecha"].where(merged["Fecha"].notna(), f2)
+    merged["Fecha"] = merged[["Fecha", f2.name]].min(axis=1)
 
-    # Email agente: prioriza saldo si existe, si no transferencia
-    m["Dirección de correo electrónico"] = m["Dirección de correo electrónico_saldo"].combine_first(
-        m["Dirección de correo electrónico_transf"]
+    # Email agente: prefer saldo
+    merged["Dirección de correo electrónico"] = merged["Dirección de correo electrónico_saldo"]
+    merged["Dirección de correo electrónico"] = merged["Dirección de correo electrónico"].where(
+        merged["Dirección de correo electrónico"].notna(),
+        merged["Dirección de correo electrónico_transfer"],
     )
 
-    # Correo registrado para carga: prioriza saldo (que explícitamente es "correo registrado en Cabify para realizar la carga"),
-    # si no, usa el Correo de transferencias (cliente)
-    m["Correo registrado en Cabify para realizar la carga"] = m["Correo registrado en Cabify para realizar la carga_saldo"].combine_first(
-        m["Correo registrado en Cabify para realizar la carga_transf"]
-    )
-
-    # Motivo: unir únicos (saldo + transferencia)
-    def join_unique(a, b):
-        vals = []
-        for x in [a, b]:
-            x = safe_strip(x)
-            if x:
-                vals.append(x)
-        # unique preserving order
-        out = []
-        for v in vals:
-            if v not in out:
-                out.append(v)
-        return " | ".join(out) if out else None
-
-    m["Motivo compensación"] = [
-        join_unique(a, b) for a, b in zip(m.get("Motivo_saldo"), m.get("Motivo_transferencia"))
+    # Correo registrado: prefer saldo
+    merged["Correo registrado en Cabify para realizar la carga"] = merged[
+        "Correo registrado en Cabify para realizar la carga_saldo"
     ]
+    merged["Correo registrado en Cabify para realizar la carga"] = merged[
+        "Correo registrado en Cabify para realizar la carga"
+    ].where(
+        merged["Correo registrado en Cabify para realizar la carga"].notna(),
+        merged["Correo registrado en Cabify para realizar la carga_transfer"],
+    )
 
     # Monto total
-    m["Monto a compensar"] = (
-        pd.to_numeric(m.get("Monto_saldo"), errors="coerce").fillna(0)
-        + pd.to_numeric(m.get("Monto_transferencia"), errors="coerce").fillna(0)
+    merged["Monto_saldo"] = merged["Monto_saldo"].fillna(0.0)
+    merged["Monto_transfer"] = merged["Monto_transfer"].fillna(0.0)
+    merged["Monto a compensar"] = merged["Monto_saldo"] + merged["Monto_transfer"]
+
+    # Motivo unificado: prefer saldo, si no, usar motivo aeropuerto de transfer
+    merged["Motivo compensación"] = merged["Motivo_saldo"]
+    merged["Motivo compensación"] = merged["Motivo compensación"].where(
+        merged["Motivo compensación"].notna() & (merged["Motivo compensación"].astype(str).str.strip() != ""),
+        merged["Motivo_transfer_aeropuerto"],
     )
-    m.loc[m["Monto a compensar"] == 0, "Monto a compensar"] = np.nan
 
     # Clasificación
-    has_s = m.get("Fuente_saldo").fillna(False)
-    has_t = m.get("Fuente_transferencia").fillna(False)
+    has_s = merged["Fuente_saldo"].fillna(False)
+    has_t = merged["Fuente_transfer"].fillna(False)
+    merged["Clasificación"] = "Sin clasificar"
+    merged.loc[has_s & ~has_t, "Clasificación"] = "Saldo (Aeropuerto)"
+    merged.loc[~has_s & has_t, "Clasificación"] = "Transferencia (Aeropuerto)"
+    merged.loc[has_s & has_t, "Clasificación"] = "Saldo + Transferencia (Aeropuerto)"
 
-    def classify(s, t):
-        if s and t:
-            return "Aeropuerto - Mixta (Saldo + Transferencia)"
-        if s:
-            return "Aeropuerto - Saldo"
-        if t:
-            return "Aeropuerto - Transferencia"
-        return None
+    # id_reserva por ahora vacío
+    merged["id_reserva"] = ""
 
-    m["Clasificación"] = [classify(bool(s), bool(t)) for s, t in zip(has_s, has_t)]
-
-    # id_reserva vacío por ahora
-    m["id_reserva"] = ""
-
-    # Selección final
-    out = m[[
-        "Fecha",
-        "Dirección de correo electrónico",
-        "Numero",
-        "Correo registrado en Cabify para realizar la carga",
-        "Monto a compensar",
-        "Motivo compensación",
-        "id_reserva",
-        "Clasificación",
-    ]].copy()
+    # Selección final de columnas
+    final = merged[
+        [
+            "Fecha",
+            "Dirección de correo electrónico",
+            "Numero",
+            "Correo registrado en Cabify para realizar la carga",
+            "Monto a compensar",
+            "Motivo compensación",
+            "id_reserva",
+            "Clasificación",
+        ]
+    ].copy()
 
     # Ordenar por fecha desc
-    out = out.sort_values(["Fecha", "Numero"], ascending=[False, False])
-
-    return out
-
-
-def df_to_excel_bytes(df: pd.DataFrame, sheet_name="master") -> bytes:
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    return bio.getvalue()
+    final = final.sort_values("Fecha", ascending=False, na_position="last").reset_index(drop=True)
+    return final
 
 
 # =========================
 # UI
 # =========================
-st.title("Máster de Compensaciones (Aeropuerto)")
+st.title("Máster de Compensaciones Aeropuerto")
 
-with st.sidebar:
-    st.header("1) Descarga desde Google Sheets")
+with st.expander("Links de referencia", expanded=False):
+    st.write("**Carga de Saldo**:", SALDO_SHEET_URL)
+    st.write("**Compensaciones Transferencia**:", TRANSF_SHEET_URL)
 
-    st.caption("Carga de Saldo (Compensaciones por saldo)")
-    saldo_export_url = build_export_xlsx_url(SHEET_SALDO_URL)
-    st.link_button("Abrir Sheet (Saldo)", SHEET_SALDO_URL)
+colA, colB = st.columns(2)
 
-    st.caption("Compensaciones Transferencia (filtraremos Motivo = Compensación Aeropuerto)")
-    transf_export_url = build_export_xlsx_url(SHEET_TRANSF_URL)
-    st.link_button("Abrir Sheet (Transferencia)", SHEET_TRANSF_URL)
-
-    st.divider()
-
-    # Descargar bytes y generar botones
-    if st.button("🔄 Descargar ambos Sheets (xlsx)"):
-        st.session_state["saldo_bytes"] = fetch_bytes(saldo_export_url)
-        st.session_state["transf_bytes"] = fetch_bytes(transf_export_url)
-        st.session_state["saldo_sha"] = sha256_bytes(st.session_state["saldo_bytes"])
-        st.session_state["transf_sha"] = sha256_bytes(st.session_state["transf_bytes"])
-        st.success("Descargados. Ya puedes bajar los archivos o compararlos con los locales.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if "saldo_bytes" in st.session_state:
-            st.download_button(
-                "⬇️ Descargar Saldo.xlsx",
-                data=st.session_state["saldo_bytes"],
-                file_name="Carga_de_Saldo.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-    with col2:
-        if "transf_bytes" in st.session_state:
-            st.download_button(
-                "⬇️ Descargar Transferencia.xlsx",
-                data=st.session_state["transf_bytes"],
-                file_name="Compensaciones_Transferencia.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-    if "saldo_sha" in st.session_state or "transf_sha" in st.session_state:
-        with st.expander("Ver checksums (SHA-256) descargados"):
-            if "saldo_sha" in st.session_state:
-                st.code(f"Saldo SHA-256: {st.session_state['saldo_sha']}")
-            if "transf_sha" in st.session_state:
-                st.code(f"Transferencia SHA-256: {st.session_state['transf_sha']}")
-
-st.header("2) Cargar archivos locales y validar (checksum)")
-
-cA, cB = st.columns(2)
-
-with cA:
-    up_saldo = st.file_uploader("Sube el Excel local de Carga de Saldo (xlsx)", type=["xlsx"], key="up_saldo")
-with cB:
-    up_transf = st.file_uploader("Sube el Excel local de Transferencias (xlsx)", type=["xlsx"], key="up_transf")
-
-# Comparación checksum
-def checksum_status(label: str, uploaded_file, session_key_bytes: str, session_key_sha: str):
-    if uploaded_file is None:
-        return
-    ub = uploaded_file.getvalue()
-    u_sha = sha256_bytes(ub)
-
-    st.subheader(f"Checksum: {label}")
-    st.write(f"Local SHA-256: `{u_sha}`")
-
-    if session_key_sha in st.session_state:
-        st.write(f"Sheet SHA-256: `{st.session_state[session_key_sha]}`")
-        if u_sha == st.session_state[session_key_sha]:
-            st.success("✅ El archivo local coincide con el Sheet (checksum igual).")
-        else:
-            st.warning("⚠️ El archivo local NO coincide con el Sheet (checksum distinto).")
+with colA:
+    st.subheader("1) Carga de Saldo (Sheet)")
+    dl_saldo = download_sheet_bytes(SALDO_SHEET_ID, SALDO_GID)
+    if dl_saldo["error"]:
+        st.error("No pude descargar desde Google Sheets (aún puedes cargar archivo local).")
+        st.caption(dl_saldo["error"])
+        st.write("Prueba abrir el Sheet y compartirlo como **Cualquiera con el enlace: Lector**.")
+        st.write("Link:", SALDO_SHEET_URL)
     else:
-        st.info("Descarga primero desde el Sheet (botón en la barra lateral) para poder comparar checksums.")
+        st.success(f"Descarga lista desde Sheet ({dl_saldo['kind'].upper()}). SHA256: {dl_saldo['sha256'][:12]}…")
+        st.download_button(
+            label="⬇️ Descargar Carga de Saldo",
+            data=dl_saldo["bytes"],
+            file_name=f"carga_saldo_{SALDO_GID}.{ 'xlsx' if dl_saldo['kind']=='xlsx' else 'csv'}",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if dl_saldo["kind"] == "xlsx"
+            else "text/csv",
+        )
 
-with st.container():
-    c1, c2 = st.columns(2)
-    with c1:
-        if up_saldo is not None:
-            checksum_status("Saldo", up_saldo, "saldo_bytes", "saldo_sha")
-    with c2:
-        if up_transf is not None:
-            checksum_status("Transferencia", up_transf, "transf_bytes", "transf_sha")
+    up_saldo = st.file_uploader("📤 Cargar archivo local de Carga de Saldo (xlsx/csv)", type=["xlsx", "xls", "csv"], key="up_saldo")
+
+with colB:
+    st.subheader("2) Transferencias (Sheet)")
+    dl_transf = download_sheet_bytes(TRANSF_SHEET_ID, TRANSF_GID)
+    if dl_transf["error"]:
+        st.error("No pude descargar desde Google Sheets (aún puedes cargar archivo local).")
+        st.caption(dl_transf["error"])
+        st.write("Prueba abrir el Sheet y compartirlo como **Cualquiera con el enlace: Lector**.")
+        st.write("Link:", TRANSF_SHEET_URL)
+    else:
+        st.success(f"Descarga lista desde Sheet ({dl_transf['kind'].upper()}). SHA256: {dl_transf['sha256'][:12]}…")
+        st.download_button(
+            label="⬇️ Descargar Transferencias",
+            data=dl_transf["bytes"],
+            file_name=f"transferencias_{TRANSF_GID}.{ 'xlsx' if dl_transf['kind']=='xlsx' else 'csv'}",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if dl_transf["kind"] == "xlsx"
+            else "text/csv",
+        )
+
+    up_transf = st.file_uploader("📤 Cargar archivo local de Transferencias (xlsx/csv)", type=["xlsx", "xls", "csv"], key="up_transf")
+
 
 st.divider()
-st.header("3) Generar Máster unificado (ticket único)")
+st.subheader("3) Validación (checksum) + Generación máster")
 
-btn_run = st.button("⚙️ Generar Máster", type="primary")
+def checksum_block(label: str, uploaded_file, dl_info: dict):
+    if uploaded_file is None:
+        st.info(f"{label}: carga un archivo local para validar checksum.")
+        return None
 
-if btn_run:
-    if up_saldo is None or up_transf is None:
-        st.error("Debes subir ambos archivos locales (Saldo y Transferencia) para generar el máster.")
+    df, b, sha = read_uploaded_file(uploaded_file)
+    st.write(f"**{label} (local)**: `{uploaded_file.name}` — SHA256: `{sha[:12]}…`")
+
+    if dl_info.get("sha256"):
+        if sha == dl_info["sha256"]:
+            st.success(f"{label}: ✅ coincide con lo último descargado del Sheet.")
+        else:
+            st.warning(
+                f"{label}: ⚠️ NO coincide con lo último descargado del Sheet. "
+                f"(local {sha[:12]}… vs sheet {dl_info['sha256'][:12]}…)"
+            )
+    else:
+        st.caption(f"{label}: checksum contra Sheet no disponible (descarga bloqueada o fallida).")
+
+    return df
+
+
+c1, c2 = st.columns(2)
+with c1:
+    df_saldo_in = checksum_block("Carga de Saldo", up_saldo, dl_saldo)
+with c2:
+    df_transf_in = checksum_block("Transferencias", up_transf, dl_transf)
+
+btn = st.button("⚙️ Generar Máster por Ticket", type="primary")
+
+if btn:
+    if df_saldo_in is None or df_transf_in is None:
+        st.error("Necesitas cargar ambos archivos localmente para generar el máster.")
         st.stop()
 
-    # Leer
     try:
-        df_saldo_raw = pd.read_excel(io.BytesIO(up_saldo.getvalue()), engine="openpyxl")
-        df_transf_raw = pd.read_excel(io.BytesIO(up_transf.getvalue()), engine="openpyxl")
-    except Exception as e:
-        st.exception(e)
-        st.stop()
+        df_saldo_std = standardize_saldo(df_saldo_in)
+        df_transf_std = standardize_transfer(df_transf_in)
+        master = build_master(df_saldo_std, df_transf_std)
 
-    # Transformar
-    try:
-        df_saldo = transform_saldo(df_saldo_raw)
-        df_transf = transform_transfer(df_transf_raw)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+        st.success(f"Máster generado: {len(master):,} tickets únicos.")
+        st.dataframe(master, use_container_width=True, height=420)
 
-    # Debug info
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Registros Saldo (raw)", len(df_saldo_raw))
-    c2.metric("Registros Transfer (raw)", len(df_transf_raw))
-    c3.metric("Transfer filtradas (Aeropuerto)", len(df_transf))
+        # Export xlsx
+        out_xlsx = io.BytesIO()
+        with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+            master.to_excel(writer, index=False, sheet_name="Master")
+            df_saldo_std.to_excel(writer, index=False, sheet_name="Saldo_std")
+            df_transf_std.to_excel(writer, index=False, sheet_name="Transfer_std")
+        out_xlsx.seek(0)
 
-    # Unificar
-    df_master = build_master(df_saldo, df_transf)
-
-    # Mostrar
-    st.subheader("Vista previa (máster)")
-    st.dataframe(df_master, use_container_width=True, height=420)
-
-    # Descargas
-    excel_bytes = df_to_excel_bytes(df_master, sheet_name="master_compensaciones")
-    csv_bytes = df_master.to_csv(index=False).encode("utf-8")
-
-    cA, cB = st.columns(2)
-    with cA:
         st.download_button(
             "⬇️ Descargar Máster (Excel)",
-            data=excel_bytes,
-            file_name="master_compensaciones.xlsx",
+            data=out_xlsx.getvalue(),
+            file_name=f"master_compensaciones_aeropuerto_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    with cB:
-        st.download_button(
-            "⬇️ Descargar Máster (CSV)",
-            data=csv_bytes,
-            file_name="master_compensaciones.csv",
-            mime="text/csv",
-        )
 
-    st.caption(
-        "Notas: "
-        "1) Transferencias se filtran por Motivo='Compensación Aeropuerto'. "
-        "2) 'Motivo compensación' unifica motivo de saldo y el motivo seleccionado en transferencias. "
-        "3) Monto total suma Saldo + Transferencia si el ticket aparece en ambas."
+    except Exception as e:
+        st.error("Ocurrió un error generando el máster.")
+        st.exception(e)
+
+
+with st.expander("Diagnóstico (por si falla la descarga desde Sheets)", expanded=False):
+    st.write(
+        "- Si ves **HTTPError** en Streamlit Cloud al intentar descargar, casi siempre es por permisos.\n"
+        "- Verifica que cada Google Sheet esté compartido como **Cualquiera con el enlace: Lector**.\n"
+        "- Si está restringido a tu organización, Google puede devolver HTML/login y la app lo bloqueará.\n"
+        "- Aun así, puedes usar **carga local** y el máster se generará igual."
     )
 
-st.divider()
-with st.expander("Ayuda / supuestos importantes"):
-    st.markdown(
-        """
-- **Ticket**: se normaliza a solo dígitos. Si viene en URL, se toma lo que está después del último `/`.
-- **Monto**: se intenta normalizar a CLP.  
-  - Si viene como `14.968` se interpreta como `14968`.  
-  - Si viene como `28.471` (a veces visible como `$28.47`) se interpreta como `28471` (heurística *x1000*).
-- Si tus archivos exportados traen encabezados distintos, el error te dirá qué columna no pudo identificar.
-        """
-    )
