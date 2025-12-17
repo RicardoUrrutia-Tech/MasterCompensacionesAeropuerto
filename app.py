@@ -1,9 +1,8 @@
 import io
 import re
 import hashlib
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -17,454 +16,377 @@ st.set_page_config(page_title="Máster Compensaciones Aeropuerto", layout="wide"
 SALDO_SHEET_URL = "https://docs.google.com/spreadsheets/d/1Yj8q2dnlKqIZ1-vdr7wZZp_jvXiLoYO6Qwc8NeIeUnE/edit?gid=1139202449#gid=1139202449"
 TRANSFER_SHEET_URL = "https://docs.google.com/spreadsheets/d/1yHTfTOD-N8VYBSzQRCkaNpMpAQHykBzVB5mYsXS6rHs/edit?resourcekey=&gid=1627777729#gid=1627777729"
 
-USER_AGENT = "Mozilla/5.0 (compatible; MasterCompensaciones/1.0; +https://streamlit.io)"
-
 
 # =========================
-# Helpers: URLs / bytes / checksum
+# Helpers
 # =========================
-def md5_bytes(b: bytes) -> str:
-    return hashlib.md5(b).hexdigest()
+def sha256_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
 
 
-def parse_sheet_id_and_gid(sheet_url: str):
+def parse_sheet_id_gid(sheet_url: str):
     """
-    Extract spreadsheet ID and gid from a Google Sheets URL.
+    Extract spreadsheet_id and gid from a Google Sheets URL.
     """
-    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
-    sheet_id = m.group(1) if m else None
-
-    # gid can appear as query param or fragment
-    gid = None
-    try:
-        parsed = urlparse(sheet_url)
-        qs = parse_qs(parsed.query)
-        if "gid" in qs:
-            gid = qs["gid"][0]
-        if gid is None and parsed.fragment:
-            # fragment might contain gid=...
-            frag_qs = parse_qs(parsed.fragment)
-            if "gid" in frag_qs:
-                gid = frag_qs["gid"][0]
-            else:
-                m2 = re.search(r"gid=(\d+)", parsed.fragment)
-                gid = m2.group(1) if m2 else None
-    except Exception:
-        gid = None
-
-    return sheet_id, gid
+    m = re.search(r"/spreadsheets/d/([^/]+)/", sheet_url)
+    if not m:
+        return None, None
+    spreadsheet_id = m.group(1)
+    gid_m = re.search(r"gid=(\d+)", sheet_url)
+    gid = gid_m.group(1) if gid_m else None
+    return spreadsheet_id, gid
 
 
-def build_export_url(sheet_url: str, fmt: str = "xlsx") -> str:
+def export_xlsx_url(sheet_url: str) -> str:
     """
-    Build a direct export URL.
-    fmt: xlsx or csv (csv requires gid ideally; if missing, exports first sheet)
+    Unauthenticated export endpoint.
+    NOTE: Will fail (403/404) if the sheet is not accessible publicly from the server.
     """
-    sheet_id, gid = parse_sheet_id_and_gid(sheet_url)
-    if not sheet_id:
-        raise ValueError("No se pudo extraer el spreadsheetId desde la URL.")
-
-    if fmt == "xlsx":
-        # xlsx ignores gid sometimes, but we include it (common pattern).
-        return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx&gid={gid or 0}"
-    elif fmt == "csv":
-        # csv typically needs gid to pick the tab
-        if gid:
-            return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-        return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
-    else:
-        raise ValueError("Formato no soportado.")
+    sid, gid = parse_sheet_id_gid(sheet_url)
+    if not sid or not gid:
+        return sheet_url
+    return f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx&gid={gid}"
 
 
 def fetch_bytes(url: str, timeout: int = 30) -> bytes:
-    """
-    Download file bytes. Raises HTTPError on non-2xx.
-    """
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; MasterCompensaciones/1.0; +https://streamlit.io)"
+    }
+    r = requests.get(url, headers=headers, timeout=timeout)
     r.raise_for_status()
     return r.content
 
 
-# =========================
-# Helpers: column picking / safe series
-# =========================
-def norm_colname(s: str) -> str:
-    s = str(s).strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-def pick_col(df: pd.DataFrame, candidates):
+def read_excel_any(b: bytes) -> pd.DataFrame:
     """
-    Pick the first matching column by normalized name (exact or contains).
-    candidates: list of strings
+    Read first sheet of an xlsx into DataFrame.
     """
-    if df is None or df.empty:
-        return None
-    cols = list(df.columns)
-    nmap = {c: norm_colname(c) for c in cols}
+    bio = io.BytesIO(b)
+    return pd.read_excel(bio, engine="openpyxl")
 
-    cand_norm = [norm_colname(x) for x in candidates]
 
-    # exact match
-    for c in cols:
-        if nmap[c] in cand_norm:
+def normalize_colnames(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def pick_first_col(df: pd.DataFrame, candidates):
+    """
+    Return the first existing column name from candidates. If duplicates exist,
+    pandas might expose df[col] as a DataFrame (2D). We always take the first.
+    """
+    for c in candidates:
+        if c in df.columns:
+            # Handle duplicate column names
+            sel = df.loc[:, c]
+            if isinstance(sel, pd.DataFrame):
+                return sel.columns[0]  # first duplicate
             return c
-
-    # contains match (useful if excel renames with .1 etc.)
-    for cn in cand_norm:
-        for c in cols:
-            if cn and cn in nmap[c]:
-                return c
     return None
 
 
-def ensure_series(x, length=None) -> pd.Series:
+def to_datetime_series(s: pd.Series) -> pd.Series:
     """
-    Ensure x is a 1D Series (if DataFrame due to duplicated column names, take first col).
+    Robust datetime parsing for dd/mm/yyyy and timestamps.
     """
-    if isinstance(x, pd.DataFrame):
-        x = x.iloc[:, 0]
-    if isinstance(x, pd.Index):
-        x = pd.Series(list(x))
-    if not isinstance(x, pd.Series):
-        x = pd.Series(x)
-
-    if length is not None and len(x) != length:
-        # align by reindexing (best-effort)
-        x = x.reset_index(drop=True)
-        if len(x) < length:
-            x = x.reindex(range(length))
-        else:
-            x = x.iloc[:length]
-    return x
-
-
-def to_datetime_series(x: pd.Series) -> pd.Series:
-    """
-    Robust datetime parse for typical Sheets/Excel exports.
-    """
-    x = ensure_series(x)
-    # Try direct parse
-    dt = pd.to_datetime(x, errors="coerce", dayfirst=True)
-
-    # Sometimes numeric excel serial dates appear
-    if dt.isna().all():
-        numeric = pd.to_numeric(x, errors="coerce")
-        dt2 = pd.to_datetime(numeric, unit="D", origin="1899-12-30", errors="coerce")
-        dt = dt2
+    if s is None:
+        return pd.Series([pd.NaT] * 0)
+    # Ensure 1D
+    if isinstance(s, pd.DataFrame):
+        s = s.iloc[:, 0]
+    s2 = s.copy()
+    # Strings
+    s2 = s2.astype(str).str.strip()
+    s2 = s2.replace({"nan": "", "None": ""})
+    dt = pd.to_datetime(s2, errors="coerce", dayfirst=True)
     return dt
 
 
-# =========================
-# Parsing business fields
-# =========================
-def parse_ticket_value(v) -> str:
+def extract_ticket(value) -> str:
     """
-    Ticket could be:
-    - "66171869"
-    - "#66185638"
-    - "https://cabify.zendesk.com/agent/tickets/67587605" (take last / part)
+    Ticket can be:
+      - '66171869'
+      - '#66185638'
+      - 'https://cabify.zendesk.com/agent/tickets/67587605' -> 67587605
+    We return digits as string, or ''.
     """
-    if v is None or (isinstance(v, float) and np.isnan(v)):
+    if pd.isna(value):
         return ""
-    s = str(v).strip()
-
-    if not s or s.lower() in {"nan", "none"}:
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none"):
         return ""
 
-    # If URL, take last segment
-    if "http://" in s.lower() or "https://" in s.lower():
-        # remove trailing slashes
-        s2 = s.rstrip("/")
-        last = s2.split("/")[-1]
-        # sometimes includes querystring
-        last = last.split("?")[0].strip()
-        # remove non-digits but keep if digits exist
-        digits = re.findall(r"\d+", last)
-        return digits[0] if digits else last
+    # If URL, take last path segment
+    if "http://" in s or "https://" in s:
+        try:
+            path = urlparse(s).path.strip("/")
+            last = path.split("/")[-1] if path else s
+            s = last
+        except Exception:
+            pass
 
     # Remove leading '#'
-    s = s.replace("#", " ").strip()
+    s = s.lstrip("#").strip()
 
-    # Extract first digits sequence (ticket is numeric)
-    digits = re.findall(r"\d+", s)
-    return digits[0] if digits else s
+    # Extract last run of digits (prefer long)
+    m = re.findall(r"\d+", s)
+    if not m:
+        return ""
+    # choose the longest chunk, if tie choose last
+    m_sorted = sorted(m, key=lambda x: (len(x), m.index(x)))
+    ticket = m_sorted[-1]
+    return ticket
 
 
-def parse_amount(v) -> float:
+def extract_id_reserva(value) -> str:
     """
-    Normalize amounts that may look like:
-      19980
-      497.572   (CL thousands separator)
-      14.968
-      $28.47    (user reports it actually means 28.471 -> 28471)
-    Heuristics:
-    - Remove currency symbols/spaces.
-    - If has both '.' and ',' -> assume '.' thousands, ',' decimals.
-    - If only '.' and last group len==3 -> thousands separators, remove dots.
-    - If only '.' and last group len==2 and value < 1000 -> treat as "thousands-like" and multiply by 1000.
+    Field: 'Link payments, link del viaje o numero reserva'
+    If URL, keep last path segment; else keep trimmed text.
     """
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return 0.0
-
-    if isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool):
-        # already numeric
+    if pd.isna(value):
+        return ""
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return ""
+    if "http://" in s or "https://" in s:
         try:
-            return float(v)
+            path = urlparse(s).path.strip("/")
+            last = path.split("/")[-1] if path else s
+            return last.strip()
         except Exception:
-            return 0.0
+            return s
+    return s
 
-    s = str(v).strip()
-    if not s or s.lower() in {"nan", "none"}:
+
+def parse_clp_amount(x) -> float:
+    """
+    Parse amounts that may look like:
+      - 19980
+      - 7000
+      - 13.990  (thousands dot)
+      - 497.572 (thousands dot)
+      - $28.47  (ambiguous; we parse as 28.47 -> 28.47)
+      - 28.471  (thousands dot pattern -> 28471)
+    Return float (later we can round to int if desired).
+    """
+    if pd.isna(x):
         return 0.0
 
-    s = s.replace("$", "").replace("CLP", "").replace("clp", "")
-    s = s.replace(" ", "")
+    # If numeric already
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        try:
+            if pd.isna(x):
+                return 0.0
+        except Exception:
+            pass
+        return float(x)
 
-    # If it's something like "28.471" (as text), this logic will handle.
+    s = str(x).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return 0.0
+
+    # Remove currency symbols and spaces
+    s = s.replace("$", "").replace("CLP", "").replace(" ", "").strip()
+
+    # If pattern like 497.572 or 14.968 or 28.471 -> treat dot as thousands
+    if re.fullmatch(r"\d{1,3}(\.\d{3})+", s):
+        return float(s.replace(".", ""))
+
+    # If it contains comma as decimal separator (rare here), normalize
+    # Example: 10.990,50 -> 10990.50 or 10,5 -> 10.5
     if "," in s and "." in s:
-        # assume 1.234,56
-        s2 = s.replace(".", "").replace(",", ".")
+        # assume dot thousands, comma decimal
+        s = s.replace(".", "").replace(",", ".")
         try:
-            return float(s2)
+            return float(s)
         except Exception:
             return 0.0
-
     if "," in s and "." not in s:
-        # could be decimals with comma, or thousands with comma; assume decimals
-        s2 = s.replace(".", "").replace(",", ".")
+        # assume comma decimal
         try:
-            return float(s2)
+            return float(s.replace(",", "."))
         except Exception:
             return 0.0
 
-    if "." in s and "," not in s:
-        parts = s.split(".")
-        # remove empty parts
-        parts = [p for p in parts if p != ""]
-        if len(parts) == 1:
-            try:
-                return float(parts[0])
-            except Exception:
-                return 0.0
-
-        last = parts[-1]
-        # thousands separator pattern: groups of 3
-        if len(last) == 3:
-            s2 = "".join(parts)
-            try:
-                return float(s2)
-            except Exception:
-                return 0.0
-
-        # ambiguous case: e.g. "28.47" in CLP context
-        # If looks like 2 decimals and base value < 1000, multiply by 1000
-        if len(last) == 2:
-            try:
-                val = float(s)
-                if val < 1000:
-                    return float(int(round(val * 1000)))
-                return val
-            except Exception:
-                # fallback: remove dots
-                s2 = "".join(parts)
-                try:
-                    return float(s2)
-                except Exception:
-                    return 0.0
-
-        # fallback: remove dots
-        s2 = "".join(parts)
-        try:
-            return float(s2)
-        except Exception:
-            return 0.0
-
-    # plain number
+    # Plain float/int with dot decimal
     try:
         return float(s)
     except Exception:
-        # try extract digits
+        # last attempt: keep digits only
         digs = re.findall(r"\d+", s)
         return float(digs[0]) if digs else 0.0
 
 
-def extract_id_reserva(v) -> str:
+def safe_1d(series_or_df, length: int):
     """
-    From 'Link payments, link del viaje o numero reserva'.
-    Could be a URL (take last meaningful segment) or a raw reservation number.
+    Ensure we return a 1D Series of required length, filling missing with ''.
     """
-    if v is None or (isinstance(v, float) and np.isnan(v)):
-        return ""
-    s = str(v).strip()
-    if not s or s.lower() in {"nan", "none"}:
-        return ""
-
-    if "http://" in s.lower() or "https://" in s.lower():
-        s2 = s.rstrip("/")
-        last = s2.split("/")[-1]
-        last = last.split("?")[0].strip()
-        return last
-
+    if series_or_df is None:
+        return pd.Series([""] * length)
+    if isinstance(series_or_df, pd.DataFrame):
+        s = series_or_df.iloc[:, 0]
+    else:
+        s = series_or_df
+    if len(s) != length:
+        # reindex to length
+        s = pd.Series(list(s) + [""] * max(0, length - len(s)))
+        s = s.iloc[:length]
     return s
 
 
 # =========================
-# Reading files (downloaded or uploaded)
-# =========================
-def read_table_from_bytes(file_bytes: bytes, filename_hint: str = "file.xlsx") -> pd.DataFrame:
-    """
-    Read xlsx or csv bytes into DataFrame.
-    """
-    name = filename_hint.lower()
-    bio = io.BytesIO(file_bytes)
-
-    if name.endswith(".csv"):
-        return pd.read_csv(bio)
-    # default xlsx
-    return pd.read_excel(bio)
-
-
-def read_uploaded(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    b = uploaded_file.getvalue()
-    return read_table_from_bytes(b, filename_hint=name)
-
-
-# =========================
-# Build master
+# Master builder
 # =========================
 def build_master(df_saldo_raw: pd.DataFrame, df_transfer_raw: pd.DataFrame) -> pd.DataFrame:
-    # --------- SALDO base ----------
-    # Expected-ish columns:
-    # Marca temporal / Fecha, Dirección de correo electrónico, Numero ticket,
-    # Correo registrado..., Monto a compensar, Motivo compensación
-    date_col = pick_col(df_saldo_raw, ["marca temporal", "fecha", "timestamp"])
-    email_col = pick_col(df_saldo_raw, ["dirección de correo electrónico", "direccion de correo electronico", "email", "correo"])
-    ticket_col = pick_col(df_saldo_raw, ["numero ticket", "número ticket", "ticket", "numero de ticket"])
-    correo_reg_col = pick_col(df_saldo_raw, ["correo registrado en cabify para realizar la carga", "correo registrado", "correo registrado en cabify"])
-    monto_col = pick_col(df_saldo_raw, ["monto a compensar", "monto", "importe"])
-    motivo_col = pick_col(df_saldo_raw, ["motivo compensación", "motivo compensacion", "motivo"])
+    df_saldo_raw = normalize_colnames(df_saldo_raw)
+    df_transfer_raw = normalize_colnames(df_transfer_raw)
 
-    n_s = len(df_saldo_raw)
-    df_saldo = pd.DataFrame({
-        "Fecha": to_datetime_series(df_saldo_raw[date_col]) if date_col else pd.Series([pd.NaT] * n_s),
-        "Dirección de correo electrónico": ensure_series(df_saldo_raw[email_col], n_s) if email_col else pd.Series([""] * n_s),
-        "Numero": ensure_series(df_saldo_raw[ticket_col], n_s).map(parse_ticket_value) if ticket_col else pd.Series([""] * n_s),
-        "Correo registrado en Cabify para realizar la carga": ensure_series(df_saldo_raw[correo_reg_col], n_s) if correo_reg_col else pd.Series([""] * n_s),
-        "Monto_saldo": ensure_series(df_saldo_raw[monto_col], n_s).map(parse_amount) if monto_col else pd.Series([0.0] * n_s),
-        "Motivo_saldo": ensure_series(df_saldo_raw[motivo_col], n_s) if motivo_col else pd.Series([""] * n_s),
-    })
+    # --- SALDO (compensaciones con cargo de saldo) ---
+    # Expected columns:
+    # Marca temporal (or similar), Dirección de correo electrónico, Numero ticket, Correo registrado..., Monto..., Motivo compensación
+    saldo_date_col = pick_first_col(df_saldo_raw, ["Marca temporal", "Fecha", "Timestamp", "marca temporal"])
+    saldo_email_col = pick_first_col(df_saldo_raw, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email", "Correo", "Dirección correo electrónico"])
+    saldo_ticket_col = pick_first_col(df_saldo_raw, ["Numero ticket", "Número ticket", "Ticket", "Numero", "N° ticket"])
+    saldo_cabify_mail_col = pick_first_col(df_saldo_raw, ["Correo registrado en Cabify para realizar la carga", "Correo registrado en Cabify", "Correo registrado", "Correo Cabify"])
+    saldo_amount_col = pick_first_col(df_saldo_raw, ["Monto a compensar", "Monto", "Monto a Compensar"])
+    saldo_reason_col = pick_first_col(df_saldo_raw, ["Motivo compensación", "Motivo compensacion", "Motivo", "Motivo compensación ____"])
 
-    df_saldo["Clasificación_base"] = "Saldo"
-    df_saldo["id_reserva"] = ""
+    if saldo_ticket_col is None:
+        raise ValueError("No encontré la columna de ticket en la base de SALDO (ej: 'Numero ticket').")
 
-    # --------- TRANSFER base ----------
-    # We only want rows where Motivo == "Compensación Aeropuerto"
-    motivo2_col = pick_col(df_transfer_raw, ["motivo", "motivo de compensación", "motivo compensacion"])
-    airport_motivo_col = pick_col(df_transfer_raw, ["si es compensación aeropuerto selecciona el motivo", "si es compensacion aeropuerto selecciona el motivo"])
-    date2_col = pick_col(df_transfer_raw, ["fecha", "marca temporal", "timestamp"])
-    email2_col = pick_col(df_transfer_raw, ["dirección de correo electrónico", "direccion de correo electronico", "email", "correo"])
-    correo2_col = pick_col(df_transfer_raw, ["correo"])
-    ticket2_col = pick_col(df_transfer_raw, ["ticket", "numero ticket", "número ticket"])
-    monto2_col = pick_col(df_transfer_raw, ["monto"])  # there are two "Monto" columns sometimes; pick_col handles contains
-    id_reserva_col = pick_col(df_transfer_raw, ["link payments, link del viaje o numero reserva", "link payments", "link del viaje o numero reserva"])
+    df_saldo = pd.DataFrame()
+    df_saldo["Fecha"] = to_datetime_series(df_saldo_raw.loc[:, saldo_date_col] if saldo_date_col else pd.Series([pd.NaT]*len(df_saldo_raw)))
+    df_saldo["Dirección de correo electrónico"] = safe_1d(df_saldo_raw.loc[:, saldo_email_col] if saldo_email_col else None, len(df_saldo_raw)).astype(str).str.strip()
+    df_saldo["Numero"] = safe_1d(df_saldo_raw.loc[:, saldo_ticket_col], len(df_saldo_raw)).apply(extract_ticket)
+    df_saldo["Correo registrado en Cabify para realizar la carga"] = safe_1d(df_saldo_raw.loc[:, saldo_cabify_mail_col] if saldo_cabify_mail_col else None, len(df_saldo_raw)).astype(str).str.strip()
+    df_saldo["Monto_saldo"] = safe_1d(df_saldo_raw.loc[:, saldo_amount_col] if saldo_amount_col else None, len(df_saldo_raw)).apply(parse_clp_amount)
+    df_saldo["Motivo_saldo"] = safe_1d(df_saldo_raw.loc[:, saldo_reason_col] if saldo_reason_col else None, len(df_saldo_raw)).astype(str).str.strip()
+
+    df_saldo = df_saldo[df_saldo["Numero"].astype(str).str.len() > 0].copy()
+    df_saldo["Clasificación_saldo"] = "Saldo"
+
+    # If multiple rows per ticket (saldo), aggregate:
+    df_saldo_g = (
+        df_saldo.groupby("Numero", as_index=False)
+        .agg({
+            "Fecha": "min",
+            "Dirección de correo electrónico": lambda x: next((v for v in x if str(v).strip()), ""),
+            "Correo registrado en Cabify para realizar la carga": lambda x: next((v for v in x if str(v).strip()), ""),
+            "Monto_saldo": "sum",
+            "Motivo_saldo": lambda x: " | ".join(sorted({str(v).strip() for v in x if str(v).strip() and str(v).lower() != "nan"})),
+            "Clasificación_saldo": "first",
+        })
+    )
+
+    # --- TRANSFERENCIAS (filtrar Compensación Aeropuerto) ---
+    # Filter column "Motivo" == "Compensación Aeropuerto"
+    transfer_motivo_col = pick_first_col(df_transfer_raw, ["Motivo", "motivo"])
+    transfer_date_col = pick_first_col(df_transfer_raw, ["Fecha", "Marca temporal", "marca temporal"])
+    transfer_email_col = pick_first_col(df_transfer_raw, ["Dirección de correo electrónico", "Direccion de correo electronico", "Email", "Correo"])
+    transfer_cabify_mail_col = pick_first_col(df_transfer_raw, ["Correo", "Correo registrado en Cabify para realizar la carga", "Correo registrado"])
+    transfer_ticket_col = pick_first_col(df_transfer_raw, ["Ticket", "Numero ticket", "Número ticket", "N° ticket", "Numero"])
+    transfer_amount_col = pick_first_col(df_transfer_raw, ["Monto", "Monto ", "Monto  "])
+    transfer_airport_reason_col = pick_first_col(df_transfer_raw, ["Si es compensación Aeropuerto selecciona el motivo", "Si es compensacion Aeropuerto selecciona el motivo"])
+    transfer_reason_fallback_col = pick_first_col(df_transfer_raw, ["Motivo de compensación", "Motivo de compensacion", "Motivo compensación", "Motivo compensacion"])
+    transfer_idres_col = pick_first_col(df_transfer_raw, ["Link payments, link del viaje o numero reserva", "Link payments, link del viaje o numero reserva ", "Link payments, link del viaje o numero reserva  "])
+
+    if transfer_ticket_col is None:
+        raise ValueError("No encontré la columna 'Ticket' en la base de TRANSFERENCIAS.")
 
     df_transfer_f = df_transfer_raw.copy()
+    if transfer_motivo_col:
+        df_transfer_f = df_transfer_f[df_transfer_f[transfer_motivo_col].astype(str).str.strip() == "Compensación Aeropuerto"].copy()
 
-    if motivo2_col:
-        mask = df_transfer_f[motivo2_col].astype(str).str.strip().str.lower().eq("compensación aeropuerto".lower()) | \
-               df_transfer_f[motivo2_col].astype(str).str.strip().str.lower().eq("compensacion aeropuerto".lower())
-        df_transfer_f = df_transfer_f.loc[mask].copy()
+    df_transfer = pd.DataFrame()
+    df_transfer["Fecha"] = to_datetime_series(df_transfer_f.loc[:, transfer_date_col] if transfer_date_col else pd.Series([pd.NaT]*len(df_transfer_f)))
+    df_transfer["Dirección de correo electrónico"] = safe_1d(df_transfer_f.loc[:, transfer_email_col] if transfer_email_col else None, len(df_transfer_f)).astype(str).str.strip()
+    df_transfer["Numero"] = safe_1d(df_transfer_f.loc[:, transfer_ticket_col], len(df_transfer_f)).apply(extract_ticket)
 
-    n_t = len(df_transfer_f)
+    # En transferencias, "Correo" suele ser el correo del cliente (registrado en Cabify para la carga / contacto)
+    df_transfer["Correo registrado en Cabify para realizar la carga"] = safe_1d(df_transfer_f.loc[:, transfer_cabify_mail_col] if transfer_cabify_mail_col else None, len(df_transfer_f)).astype(str).str.strip()
 
-    df_transfer = pd.DataFrame({
-        "Fecha": to_datetime_series(df_transfer_f[date2_col]) if date2_col else pd.Series([pd.NaT] * n_t),
-        "Dirección de correo electrónico": ensure_series(df_transfer_f[email2_col], n_t) if email2_col else pd.Series([""] * n_t),
-        "Numero": ensure_series(df_transfer_f[ticket2_col], n_t).map(parse_ticket_value) if ticket2_col else pd.Series([""] * n_t),
-        "Correo registrado en Cabify para realizar la carga": ensure_series(df_transfer_f[correo2_col], n_t) if correo2_col else pd.Series([""] * n_t),
-        "Monto_transfer": ensure_series(df_transfer_f[monto2_col], n_t).map(parse_amount) if monto2_col else pd.Series([0.0] * n_t),
-        "Motivo_transfer": ensure_series(df_transfer_f[airport_motivo_col], n_t) if airport_motivo_col else pd.Series([""] * n_t),
-        "id_reserva": ensure_series(df_transfer_f[id_reserva_col], n_t).map(extract_id_reserva) if id_reserva_col else pd.Series([""] * n_t),
-    })
+    df_transfer["Monto_transfer"] = safe_1d(df_transfer_f.loc[:, transfer_amount_col] if transfer_amount_col else None, len(df_transfer_f)).apply(parse_clp_amount)
 
-    df_transfer["Clasificación_base"] = "Transferencia"
+    motivo_pref = safe_1d(df_transfer_f.loc[:, transfer_airport_reason_col] if transfer_airport_reason_col else None, len(df_transfer_f)).astype(str).str.strip()
+    motivo_fb = safe_1d(df_transfer_f.loc[:, transfer_reason_fallback_col] if transfer_reason_fallback_col else None, len(df_transfer_f)).astype(str).str.strip()
+    df_transfer["Motivo_transfer"] = motivo_pref.where(motivo_pref.replace({"nan": ""}).astype(str).str.strip() != "", motivo_fb)
 
-    # --------- Clean / standardize keys ----------
-    df_saldo["Numero"] = df_saldo["Numero"].astype(str).str.strip()
-    df_transfer["Numero"] = df_transfer["Numero"].astype(str).str.strip()
+    df_transfer["id_reserva"] = safe_1d(df_transfer_f.loc[:, transfer_idres_col] if transfer_idres_col else None, len(df_transfer_f)).apply(extract_id_reserva)
 
-    # Remove empty ticket rows
-    df_saldo = df_saldo.loc[df_saldo["Numero"].ne("")].copy()
-    df_transfer = df_transfer.loc[df_transfer["Numero"].ne("")].copy()
+    df_transfer = df_transfer[df_transfer["Numero"].astype(str).str.len() > 0].copy()
+    df_transfer["Clasificación_transfer"] = "Transferencia"
 
-    # --------- Merge logic: one row per ticket ----------
-    # We aggregate each base per ticket first (in case duplicates inside same base).
-    agg_s = (df_saldo
-             .groupby("Numero", dropna=False, as_index=False)
-             .agg({
-                 "Fecha": "min",
-                 "Dirección de correo electrónico": "first",
-                 "Correo registrado en Cabify para realizar la carga": "first",
-                 "Monto_saldo": "sum",
-                 "Motivo_saldo": lambda x: next((str(v).strip() for v in x if str(v).strip() and str(v).lower() not in {"nan", "none"}), "")
-             }))
-
-    agg_t = (df_transfer
-             .groupby("Numero", dropna=False, as_index=False)
-             .agg({
-                 "Fecha": "min",
-                 "Dirección de correo electrónico": "first",
-                 "Correo registrado en Cabify para realizar la carga": "first",
-                 "Monto_transfer": "sum",
-                 "Motivo_transfer": lambda x: next((str(v).strip() for v in x if str(v).strip() and str(v).lower() not in {"nan", "none"}), ""),
-                 "id_reserva": lambda x: next((str(v).strip() for v in x if str(v).strip() and str(v).lower() not in {"nan", "none"}), "")
-             }))
-
-    merged = pd.merge(agg_s, agg_t, on="Numero", how="outer", suffixes=("_saldo", "_transfer"))
-
-    # Fecha: prefer earliest non-null
-    merged["Fecha"] = merged[["Fecha_saldo", "Fecha_transfer"]].min(axis=1)
-
-    # Email: prefer saldo if exists else transfer
-    merged["Dirección de correo electrónico"] = merged["Dirección de correo electrónico_saldo"].fillna("").astype(str).str.strip()
-    merged.loc[merged["Dirección de correo electrónico"].eq(""), "Dirección de correo electrónico"] = (
-        merged["Dirección de correo electrónico_transfer"].fillna("").astype(str).str.strip()
+    # Aggregate transfer per ticket
+    df_transfer_g = (
+        df_transfer.groupby("Numero", as_index=False)
+        .agg({
+            "Fecha": "min",
+            "Dirección de correo electrónico": lambda x: next((v for v in x if str(v).strip()), ""),
+            "Correo registrado en Cabify para realizar la carga": lambda x: next((v for v in x if str(v).strip()), ""),
+            "Monto_transfer": "sum",
+            "Motivo_transfer": lambda x: " | ".join(sorted({str(v).strip() for v in x if str(v).strip() and str(v).lower() != "nan"})),
+            "id_reserva": lambda x: next((v for v in x if str(v).strip()), ""),
+            "Clasificación_transfer": "first",
+        })
     )
 
-    # Correo registrado: prefer saldo else transfer
-    merged["Correo registrado en Cabify para realizar la carga"] = merged["Correo registrado en Cabify para realizar la carga_saldo"].fillna("").astype(str).str.strip()
-    merged.loc[merged["Correo registrado en Cabify para realizar la carga"].eq(""), "Correo registrado en Cabify para realizar la carga"] = (
-        merged["Correo registrado en Cabify para realizar la carga_transfer"].fillna("").astype(str).str.strip()
+    # --- Merge saldo + transfer by Numero (ticket) ---
+    master = pd.merge(df_saldo_g, df_transfer_g, on="Numero", how="outer", suffixes=("_saldo", "_transfer"))
+
+    # Final fields
+    def coalesce(a, b):
+        a = "" if a is None or (isinstance(a, float) and pd.isna(a)) else a
+        b = "" if b is None or (isinstance(b, float) and pd.isna(b)) else b
+        return a if str(a).strip() else b
+
+    master["Fecha"] = master[["Fecha_saldo", "Fecha_transfer"]].min(axis=1)
+    master["Dirección de correo electrónico"] = master.apply(
+        lambda r: coalesce(r.get("Dirección de correo electrónico_saldo", ""), r.get("Dirección de correo electrónico_transfer", "")),
+        axis=1,
+    )
+    master["Correo registrado en Cabify para realizar la carga"] = master.apply(
+        lambda r: coalesce(r.get("Correo registrado en Cabify para realizar la carga_saldo", ""), r.get("Correo registrado en Cabify para realizar la carga_transfer", "")),
+        axis=1,
     )
 
-    # Monto total
-    merged["Monto a compensar"] = merged["Monto_saldo"].fillna(0.0) + merged["Monto_transfer"].fillna(0.0)
+    master["Monto_saldo"] = master.get("Monto_saldo", 0).fillna(0.0)
+    master["Monto_transfer"] = master.get("Monto_transfer", 0).fillna(0.0)
+    master["Monto a compensar"] = master["Monto_saldo"] + master["Monto_transfer"]
 
-    # Motivo compensación unificado:
-    # prefer saldo motive; else airport motive from transfer
-    merged["Motivo compensación"] = merged["Motivo_saldo"].fillna("").astype(str).str.strip()
-    merged.loc[merged["Motivo compensación"].eq(""), "Motivo compensación"] = (
-        merged["Motivo_transfer"].fillna("").astype(str).str.strip()
-    )
+    # Motivo unificado (union de ambos)
+    def join_motivos(r):
+        ms = str(r.get("Motivo_saldo", "")).strip()
+        mt = str(r.get("Motivo_transfer", "")).strip()
+        parts = []
+        if ms and ms.lower() != "nan":
+            parts.append(ms)
+        if mt and mt.lower() != "nan":
+            parts.append(mt)
+        # unique keep order
+        seen = set()
+        out = []
+        for p in parts:
+            for x in [t.strip() for t in p.split("|")]:
+                if x and x not in seen:
+                    seen.add(x)
+                    out.append(x)
+        return " | ".join(out)
 
-    # id_reserva from transfer (currently)
-    merged["id_reserva"] = merged["id_reserva"].fillna("").astype(str).str.strip()
+    master["Motivo compensación"] = master.apply(join_motivos, axis=1)
 
-    # Clasificación
-    has_s = merged["Monto_saldo"].fillna(0).gt(0)
-    has_t = merged["Monto_transfer"].fillna(0).gt(0)
-    merged["Clasificación"] = np.select(
-        [has_s & has_t, has_s & ~has_t, ~has_s & has_t],
-        ["Mixta", "Saldo", "Transferencia"],
-        default="Transferencia"
-    )
+    # Clasificación: Saldo / Transferencia / Saldo+Transferencia
+    has_saldo = master["Monto_saldo"].fillna(0) > 0
+    has_trans = master["Monto_transfer"].fillna(0) > 0
+    master["Clasificación"] = "Sin monto"
+    master.loc[has_saldo & ~has_trans, "Clasificación"] = "Saldo"
+    master.loc[~has_saldo & has_trans, "Clasificación"] = "Transferencia"
+    master.loc[has_saldo & has_trans, "Clasificación"] = "Saldo+Transferencia"
 
-    # Final columns
-    out = merged[[
+    master["id_reserva"] = master.get("id_reserva", "").fillna("")
+
+    # Keep requested columns
+    out = master[[
         "Fecha",
         "Dirección de correo electrónico",
         "Numero",
@@ -475,239 +397,179 @@ def build_master(df_saldo_raw: pd.DataFrame, df_transfer_raw: pd.DataFrame) -> p
         "Clasificación",
     ]].copy()
 
-    # Order / types
-    out["Numero"] = out["Numero"].astype(str).str.strip()
+    # Make monto more readable (CLP as integer)
+    out["Monto a compensar"] = out["Monto a compensar"].fillna(0.0).round(0).astype("int64")
 
-    # Optional: sort by date desc then ticket
-    out = out.sort_values(by=["Fecha", "Numero"], ascending=[False, True], na_position="last").reset_index(drop=True)
-
+    # Sort
+    out = out.sort_values(["Fecha", "Numero"], ascending=[False, False], na_position="last")
     return out
+
+
+def df_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "master") -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return bio.getvalue()
 
 
 # =========================
 # UI
 # =========================
-st.title("Máster Compensaciones Aeropuerto")
-st.caption("Une compensaciones por Saldo + Transferencias (filtrando 'Compensación Aeropuerto') y deja 1 registro por ticket.")
+st.title("Máster Compensaciones Aeropuerto (Saldo + Transferencia)")
 
-with st.expander("Fuentes (Google Sheets)", expanded=True):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Carga de Saldo (Sheet)**")
-        st.write(SALDO_SHEET_URL)
-    with c2:
-        st.markdown("**Compensaciones Transferencia (Sheet)**")
-        st.write(TRANSFER_SHEET_URL)
+with st.expander("Fuentes (Google Sheets)", expanded=False):
+    st.write("**Carga de Saldo (Saldo):**", SALDO_SHEET_URL)
+    st.write("**Compensaciones Transferencia (Transferencia):**", TRANSFER_SHEET_URL)
+    st.caption("Nota: Los botones de descarga funcionan solo si el Sheet es accesible públicamente desde el servidor. Si falla, descarga manual y carga el archivo local.")
 
-st.divider()
+colA, colB = st.columns(2)
 
-# Download section
-st.subheader("1) Descargar desde Google Sheets (botones)")
-download_col1, download_col2 = st.columns(2)
+# Download section (Saldo)
+with colA:
+    st.subheader("1) Base SALDO")
+    saldo_export_url = export_xlsx_url(SALDO_SHEET_URL)
+    st.write("Export XLSX:", saldo_export_url)
 
-if "saldo_bytes" not in st.session_state:
-    st.session_state["saldo_bytes"] = None
-if "transfer_bytes" not in st.session_state:
-    st.session_state["transfer_bytes"] = None
+    if "saldo_bytes" not in st.session_state:
+        st.session_state["saldo_bytes"] = None
+        st.session_state["saldo_checksum"] = None
+        st.session_state["saldo_dl_error"] = None
 
-with download_col1:
-    st.markdown("**Saldo**")
-    saldo_export_url = build_export_url(SALDO_SHEET_URL, "xlsx")
-    if st.button("Descargar Saldo (XLSX)", use_container_width=True):
+    if st.button("Descargar SALDO desde Sheets", use_container_width=True):
         try:
-            st.session_state["saldo_bytes"] = fetch_bytes(saldo_export_url)
-            st.success("Saldo descargado OK.")
+            b = fetch_bytes(saldo_export_url)
+            st.session_state["saldo_bytes"] = b
+            st.session_state["saldo_checksum"] = sha256_bytes(b)
+            st.session_state["saldo_dl_error"] = None
         except requests.exceptions.HTTPError as e:
+            st.session_state["saldo_dl_error"] = f"HTTPError: {e}"
             st.session_state["saldo_bytes"] = None
-            st.error(
-                "No pude descargar el Sheet de Saldo (HTTPError). "
-                "Esto suele pasar si el Sheet no es público o requiere login.\n\n"
-                "Solución típica: publicar/compartir el Sheet con acceso 'Cualquiera con el enlace (lector)' "
-                "o usar carga local."
-            )
-            st.exception(e)
+            st.session_state["saldo_checksum"] = None
         except Exception as e:
+            st.session_state["saldo_dl_error"] = f"Error: {e}"
             st.session_state["saldo_bytes"] = None
-            st.error("Error inesperado descargando Saldo.")
-            st.exception(e)
+            st.session_state["saldo_checksum"] = None
+
+    if st.session_state["saldo_dl_error"]:
+        st.error("No pude descargar SALDO desde Sheets (probable falta de permisos / sheet no público).")
+        st.code(st.session_state["saldo_dl_error"])
+        st.link_button("Abrir SALDO en el navegador", SALDO_SHEET_URL, use_container_width=True)
 
     if st.session_state["saldo_bytes"]:
         st.download_button(
-            "Bajar archivo Saldo descargado",
+            "⬇️ Descargar archivo SALDO (XLSX)",
             data=st.session_state["saldo_bytes"],
             file_name="saldo.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+            use_container_width=True,
         )
-        st.caption(f"MD5 (Saldo descargado): `{md5_bytes(st.session_state['saldo_bytes'])}`")
+        st.caption(f"Checksum (sha256): {st.session_state['saldo_checksum']}")
 
-with download_col2:
-    st.markdown("**Transferencias (filtraremos Compensación Aeropuerto al construir el máster)**")
-    transfer_export_url = build_export_url(TRANSFER_SHEET_URL, "xlsx")
-    if st.button("Descargar Transferencias (XLSX)", use_container_width=True):
+    saldo_file = st.file_uploader("Cargar SALDO local (XLSX)", type=["xlsx"], key="saldo_upl")
+
+# Download section (Transfer)
+with colB:
+    st.subheader("2) Base TRANSFERENCIA")
+    transfer_export_url = export_xlsx_url(TRANSFER_SHEET_URL)
+    st.write("Export XLSX:", transfer_export_url)
+
+    if "transfer_bytes" not in st.session_state:
+        st.session_state["transfer_bytes"] = None
+        st.session_state["transfer_checksum"] = None
+        st.session_state["transfer_dl_error"] = None
+
+    if st.button("Descargar TRANSFERENCIA desde Sheets", use_container_width=True):
         try:
-            st.session_state["transfer_bytes"] = fetch_bytes(transfer_export_url)
-            st.success("Transferencias descargadas OK.")
+            b = fetch_bytes(transfer_export_url)
+            st.session_state["transfer_bytes"] = b
+            st.session_state["transfer_checksum"] = sha256_bytes(b)
+            st.session_state["transfer_dl_error"] = None
         except requests.exceptions.HTTPError as e:
+            st.session_state["transfer_dl_error"] = f"HTTPError: {e}"
             st.session_state["transfer_bytes"] = None
-            st.error(
-                "No pude descargar el Sheet de Transferencias (HTTPError). "
-                "Esto suele pasar si el Sheet no es público o requiere login.\n\n"
-                "Solución típica: publicar/compartir el Sheet con acceso 'Cualquiera con el enlace (lector)' "
-                "o usar carga local."
-            )
-            st.exception(e)
+            st.session_state["transfer_checksum"] = None
         except Exception as e:
+            st.session_state["transfer_dl_error"] = f"Error: {e}"
             st.session_state["transfer_bytes"] = None
-            st.error("Error inesperado descargando Transferencias.")
-            st.exception(e)
+            st.session_state["transfer_checksum"] = None
+
+    if st.session_state["transfer_dl_error"]:
+        st.error("No pude descargar TRANSFERENCIA desde Sheets (probable falta de permisos / sheet no público).")
+        st.code(st.session_state["transfer_dl_error"])
+        st.link_button("Abrir TRANSFERENCIA en el navegador", TRANSFER_SHEET_URL, use_container_width=True)
 
     if st.session_state["transfer_bytes"]:
         st.download_button(
-            "Bajar archivo Transferencias descargado",
+            "⬇️ Descargar archivo TRANSFERENCIA (XLSX)",
             data=st.session_state["transfer_bytes"],
-            file_name="transferencias.xlsx",
+            file_name="transferencia.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+            use_container_width=True,
         )
-        st.caption(f"MD5 (Transferencias descargado): `{md5_bytes(st.session_state['transfer_bytes'])}`")
+        st.caption(f"Checksum (sha256): {st.session_state['transfer_checksum']}")
+
+    transfer_file = st.file_uploader("Cargar TRANSFERENCIA local (XLSX)", type=["xlsx"], key="transfer_upl")
 
 st.divider()
+st.subheader("3) Construcción del Máster")
 
-st.subheader("2) Cargar archivos localmente")
-u1, u2 = st.columns(2)
-with u1:
-    up_saldo = st.file_uploader("Sube archivo Saldo (XLSX/CSV)", type=["xlsx", "csv"], key="up_saldo")
-with u2:
-    up_transfer = st.file_uploader("Sube archivo Transferencias (XLSX/CSV)", type=["xlsx", "csv"], key="up_transfer")
-
-# Checksum compare
-st.subheader("3) Checksum simple (local vs sheet descargado)")
-chk1, chk2 = st.columns(2)
-
-with chk1:
-    if up_saldo is not None:
-        local_saldo_md5 = md5_bytes(up_saldo.getvalue())
-        st.write(f"MD5 (Saldo local): `{local_saldo_md5}`")
-        if st.session_state["saldo_bytes"]:
-            remote_saldo_md5 = md5_bytes(st.session_state["saldo_bytes"])
-            if local_saldo_md5 == remote_saldo_md5:
-                st.success("Saldo local coincide con el descargado del Sheet.")
-            else:
-                st.warning("Saldo local NO coincide con el descargado del Sheet.")
-        else:
-            st.info("No hay Saldo descargado del Sheet para comparar (usa botón de descarga o deja así).")
-    else:
-        st.caption("Sube Saldo local para ver MD5.")
-
-with chk2:
-    if up_transfer is not None:
-        local_transfer_md5 = md5_bytes(up_transfer.getvalue())
-        st.write(f"MD5 (Transfer local): `{local_transfer_md5}`")
-        if st.session_state["transfer_bytes"]:
-            remote_transfer_md5 = md5_bytes(st.session_state["transfer_bytes"])
-            if local_transfer_md5 == remote_transfer_md5:
-                st.success("Transfer local coincide con el descargado del Sheet.")
-            else:
-                st.warning("Transfer local NO coincide con el descargado del Sheet.")
-        else:
-            st.info("No hay Transfer descargado del Sheet para comparar (usa botón de descarga o deja así).")
-    else:
-        st.caption("Sube Transfer local para ver MD5.")
-
-st.divider()
-
-st.subheader("4) Construir Máster (1 registro por ticket)")
-
-def resolve_df(suggested_bytes, uploaded_file, default_name):
+# Decide input sources
+def get_df_from_choice(uploaded_file, downloaded_bytes, label):
     """
-    Priority:
-    1) If user uploaded a file -> use that
-    2) else if downloaded bytes exist -> use that
+    Prefer uploaded local file if provided, else fallback to downloaded bytes.
     """
     if uploaded_file is not None:
-        df = read_uploaded(uploaded_file)
-        src = f"local ({uploaded_file.name})"
-        return df, src
-
-    if suggested_bytes:
-        df = read_table_from_bytes(suggested_bytes, filename_hint=default_name)
-        src = f"sheet descargado ({default_name})"
-        return df, src
-
+        b = uploaded_file.getvalue()
+        return read_excel_any(b), b
+    if downloaded_bytes is not None:
+        return read_excel_any(downloaded_bytes), downloaded_bytes
     return None, None
 
 
-df_saldo_raw, src_saldo = resolve_df(st.session_state["saldo_bytes"], up_saldo, "saldo.xlsx")
-df_transfer_raw, src_transfer = resolve_df(st.session_state["transfer_bytes"], up_transfer, "transferencias.xlsx")
+df_saldo_raw, saldo_used_bytes = get_df_from_choice(saldo_file, st.session_state["saldo_bytes"], "SALDO")
+df_transfer_raw, transfer_used_bytes = get_df_from_choice(transfer_file, st.session_state["transfer_bytes"], "TRANSFER")
 
-cols_a, cols_b = st.columns(2)
-with cols_a:
-    st.markdown("**Fuente Saldo usada:** " + (src_saldo or "_(no cargada)_"))
-with cols_b:
-    st.markdown("**Fuente Transfer usada:** " + (src_transfer or "_(no cargada)_"))
-
-build_btn = st.button("Construir Máster", type="primary", use_container_width=True)
-
-if build_btn:
-    if df_saldo_raw is None or df_transfer_raw is None:
-        st.error("Falta cargar/descargar uno o ambos archivos (Saldo y Transferencias).")
+# Checksum compare (simple)
+def checksum_notice(uploaded_file, downloaded_checksum, kind):
+    if uploaded_file is None or not downloaded_checksum:
+        return
+    upl_hash = sha256_bytes(uploaded_file.getvalue())
+    if upl_hash != downloaded_checksum:
+        st.warning(
+            f"⚠️ Checksum no coincide para **{kind}**. "
+            f"Local={upl_hash[:12]}… vs Sheets={downloaded_checksum[:12]}… "
+            f"(Esto sugiere que el archivo local no es la última versión del Sheet)."
+        )
     else:
-        try:
-            master = build_master(df_saldo_raw, df_transfer_raw)
-            st.success(f"Máster construido: {len(master):,} registros (tickets únicos).")
+        st.success(f"✅ Checksum coincide para **{kind}** (local = Sheets).")
 
-            st.markdown("### Vista previa")
-            st.dataframe(master, use_container_width=True, height=420)
+checksum_notice(saldo_file, st.session_state.get("saldo_checksum"), "SALDO")
+checksum_notice(transfer_file, st.session_state.get("transfer_checksum"), "TRANSFERENCIA")
 
-            # Downloads
-            out_xlsx = io.BytesIO()
-            with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
-                master.to_excel(writer, index=False, sheet_name="master")
-            out_xlsx.seek(0)
+if df_saldo_raw is None or df_transfer_raw is None:
+    st.info("Carga ambas bases (o descarga desde Sheets si se puede) para construir el máster.")
+else:
+    try:
+        master = build_master(df_saldo_raw, df_transfer_raw)
 
-            out_csv = master.to_csv(index=False).encode("utf-8")
+        # Quick KPIs
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Tickets únicos", int(master["Numero"].nunique()))
+        c2.metric("Registros (máster)", int(len(master)))
+        c3.metric("Tickets Saldo+Transfer", int((master["Clasificación"] == "Saldo+Transferencia").sum()))
 
-            d1, d2 = st.columns(2)
-            with d1:
-                st.download_button(
-                    "Descargar Máster (XLSX)",
-                    data=out_xlsx.getvalue(),
-                    file_name="master_compensaciones.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
-            with d2:
-                st.download_button(
-                    "Descargar Máster (CSV)",
-                    data=out_csv,
-                    file_name="master_compensaciones.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+        st.dataframe(master, use_container_width=True, height=520)
 
-            st.info(
-                "Nota montos: si algún monto viene como texto tipo `28.47` en un contexto CLP, "
-                "se aplica una heurística para interpretarlo como miles (multiplica por 1000). "
-                "Si el export ya viene numérico (lo más común), se respeta el valor."
-            )
+        xlsx_master = df_to_xlsx_bytes(master, "master")
+        st.download_button(
+            "⬇️ Descargar Máster (XLSX)",
+            data=xlsx_master,
+            file_name="master_compensaciones_aeropuerto.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
-        except Exception as e:
-            st.error("Se produjo un error construyendo el máster. Tip: revisa que las columnas esperadas existan en tus archivos.")
-            st.write("Detalle:", repr(e))
-            st.exception(e)
-
-st.divider()
-
-with st.expander("Diagnóstico rápido (ver nombres de columnas detectadas)", expanded=False):
-    if df_saldo_raw is not None:
-        st.markdown("**Saldo - columnas**")
-        st.write(list(df_saldo_raw.columns))
-    else:
-        st.caption("Saldo no cargado.")
-    if df_transfer_raw is not None:
-        st.markdown("**Transferencias - columnas**")
-        st.write(list(df_transfer_raw.columns))
-    else:
-        st.caption("Transferencias no cargadas.")
-
+    except Exception as e:
+        st.error("Se produjo un error construyendo el máster. Tip: revisa que las columnas esperadas existan en tus archivos.")
+        st.code(f"{type(e).__name__}: {e}")
+        st.caption("Si quieres, pega aquí (texto) los encabezados exactos de cada archivo y lo adapto a tu caso real.")
