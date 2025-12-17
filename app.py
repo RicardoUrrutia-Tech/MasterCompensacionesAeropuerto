@@ -519,9 +519,3 @@ with st.expander("Diagnóstico (por si falla la descarga desde Sheets)", expande
         "- Si está restringido a tu organización, Google puede devolver HTML/login y la app lo bloqueará.\n"
         "- Aun así, puedes usar **carga local** y el máster se generará igual."
     )
-
-
-    except Exception as e:
-        st.error("Se produjo un error construyendo el máster. Tip: revisa que las columnas esperadas existan en tus archivos.")
-        st.code(f"{type(e).__name__}: {e}")
-        st.caption("Si quieres, pega aquí (texto) los encabezados exactos de cada archivo y lo adapto a tu caso real.")
